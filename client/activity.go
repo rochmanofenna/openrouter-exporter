@@ -29,14 +29,12 @@ type ActivityFetchResult struct {
 }
 
 const (
-	rscHeader              = "1"
-	nextRouterStateTree    = `%5B%22%22%2C%7B%22children%22%3A%5B%22(marketplace)%22%2C%7B%7D%5D%7D%2Cnull%2Cnull%2Ctrue%5D`
-	activityRSCQueryParam  = "_rsc=1hc7n"
-	analyticsJSONArrayKey  = `"analytics":[`
+	rscHeader             = "1"
+	analyticsJSONArrayKey = `"analytics":[`
 )
 
 func (c *OpenRouterClient) FetchActivity(ctx context.Context, modelSlug, sessionCookie string) ([]ActivityRecord, error) {
-	url := fmt.Sprintf("%s/%s/activity?%s", c.baseURL, modelSlug, activityRSCQueryParam)
+	url := fmt.Sprintf("%s/%s/activity", c.baseURL, modelSlug)
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -44,7 +42,6 @@ func (c *OpenRouterClient) FetchActivity(ctx context.Context, modelSlug, session
 	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("RSC", rscHeader)
-	req.Header.Set("Next-Router-State-Tree", nextRouterStateTree)
 	req.Header.Set("Cookie", "__session="+sessionCookie)
 
 	resp, err := c.httpClient.Do(req)

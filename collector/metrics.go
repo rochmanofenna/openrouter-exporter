@@ -135,4 +135,10 @@ var (
 		"Unix timestamp of the last successful activity refresh",
 		nil, nil,
 	)
+
+	MetricActivityPromptTokens5mDelta = prometheus.NewDesc(
+	    "openrouter_model_activity_prompt_tokens_delta",                                                
+	    "Approximate prompt tokens added in the last 5-minute scrape interval (delta of the daily running total; resets at UTC midnight)",                                                                       
+	    []string{"model_id"}, nil,
+	)
 )

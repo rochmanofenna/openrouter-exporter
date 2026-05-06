@@ -20,6 +20,7 @@ type CachedData struct {
 	ModelsCount    int
 	EndpointsCount int
 	ActivityErrors int
+	PromptTokenDeltas map[string]int64
 }
 
 // Re-export client types for cache consumers
@@ -38,6 +39,7 @@ type Cache struct {
 	logger                *slog.Logger
 	activityModels        []string
 	sessionCookie         string
+	prevPromptTokens      map[string]int64
 }
 
 func New(c *client.OpenRouterClient, interval time.Duration, logger *slog.Logger) *Cache {
@@ -133,6 +135,7 @@ func (c *Cache) refresh(ctx context.Context) error {
 	}
 
 	// Fetch activity data if configured
+	var deltas, newPrev map[string]int64
 	if len(c.activityModels) > 0 && c.sessionCookie != "" {
 		activityResult, err := c.client.FetchAllActivity(ctx, c.activityModels, c.sessionCookie)
 		if err != nil {
@@ -140,11 +143,16 @@ func (c *Cache) refresh(ctx context.Context) error {
 		} else {
 			cached.Activity = activityResult.Activity
 			cached.ActivityErrors = activityResult.Errors
+			deltas, newPrev = computePromptTokenDeltas(activityResult.Activity, c.prevPromptTokens)
+			cached.PromptTokenDeltas = deltas
 		}
 	}
 
 	c.mu.Lock()
 	c.data = cached
+	if newPrev != nil {
+		c.prevPromptTokens = newPrev
+	}
 	c.mu.Unlock()
 
 	c.logger.Info("cache refreshed",
@@ -168,15 +176,64 @@ func (c *Cache) refreshActivity(ctx context.Context) {
 		return
 	}
 
+	deltas, newPrev := computePromptTokenDeltas(activityResult.Activity, c.prevPromptTokens)
+
 	c.mu.Lock()
 	if c.data != nil {
 		c.data.Activity = activityResult.Activity
 		c.data.ActivityErrors = activityResult.Errors
+		c.data.PromptTokenDeltas = deltas
 	}
+	c.prevPromptTokens = newPrev
 	c.mu.Unlock()
 
 	c.logger.Info("activity refreshed",
 		"models", len(activityResult.Activity),
 		"errors", activityResult.Errors,
 	)
+}
+
+func latestRecord(records []ActivityRecord) *ActivityRecord {
+	if len(records) == 0 {
+		return nil
+	}
+	idx := 0
+	for i := 1; i < len(records); i++ {
+		if records[i].Date > records[idx].Date {
+			idx = i
+		}
+	}
+	return &records[idx]
+}
+
+// computePromptTokenDeltas returns per-model deltas of total_prompt_tokens
+// since the previous snapshot, plus the new snapshot to use as next prev.
+// On the first call (prev == nil) deltas is empty: we only seed the baseline.
+// On UTC midnight rollover (latest < prev) the delta is the new running total.
+func computePromptTokenDeltas(activity map[string][]ActivityRecord, prev map[string]int64) (map[string]int64, map[string]int64) {
+	deltas := make(map[string]int64, len(activity))
+	newPrev := make(map[string]int64, len(activity))
+
+	for modelID, records := range activity {
+		latest := latestRecord(records)
+		if latest == nil {
+			continue
+		}
+		newPrev[modelID] = latest.TotalPromptTokens
+
+		if prev == nil {
+			continue
+		}
+		p, ok := prev[modelID]
+		if !ok {
+			continue
+		}
+		d := latest.TotalPromptTokens - p
+		if d < 0 {
+			d = latest.TotalPromptTokens
+		}
+		deltas[modelID] = d
+	}
+
+	return deltas, newPrev
 }

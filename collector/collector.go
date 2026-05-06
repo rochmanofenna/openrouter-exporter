@@ -46,6 +46,7 @@ func (c *OpenRouterCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- MetricActivityScrapeDuration
 	ch <- MetricActivityScrapeErrors
 	ch <- MetricActivityScrapeTimestamp
+	ch <- MetricActivityPromptTokens5mDelta
 }
 
 func (c *OpenRouterCollector) Collect(ch chan<- prometheus.Metric) {
@@ -122,6 +123,15 @@ func (c *OpenRouterCollector) Collect(ch chan<- prometheus.Metric) {
 				ch <- prometheus.MustNewConstMetric(MetricActivityEstCostDollars, prometheus.GaugeValue, cost, modelID, date)
 			}
 		}
+	}
+
+	for modelID, delta := range data.PromptTokenDeltas {
+		ch <- prometheus.MustNewConstMetric(
+			MetricActivityPromptTokens5mDelta,
+			prometheus.GaugeValue,
+			float64(delta),
+			modelID,
+		)
 	}
 }
 
