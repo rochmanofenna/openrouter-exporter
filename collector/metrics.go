@@ -137,8 +137,24 @@ var (
 	)
 
 	MetricActivityPromptTokens5mDelta = prometheus.NewDesc(
-	    "openrouter_model_activity_prompt_tokens_delta",                                                
-	    "Approximate prompt tokens added in the last 5-minute scrape interval (delta of the daily running total; resets at UTC midnight)",                                                                       
+	    "openrouter_model_activity_prompt_tokens_delta",
+	    "Approximate prompt tokens added in the last 5-minute scrape interval (delta of the daily running total; resets at UTC midnight)",
 	    []string{"model_id"}, nil,
+	)
+
+	MetricProviderTokensDaily = prometheus.NewDesc(
+		"openrouter_provider_tokens_daily",
+		"Tokens processed by a provider for a given model on a given UTC day. Today's value is the running total so far and grows intraday.",
+		[]string{"provider", "model_id", "date"}, nil,
+	)
+	MetricProviderTokensIntradayDelta = prometheus.NewDesc(
+		"openrouter_provider_tokens_intraday_delta",
+		"Tokens added to today's running bucket since the previous activity scrape, per (provider, model). Empty on the first scrape and across UTC midnight.",
+		[]string{"provider", "model_id"}, nil,
+	)
+	MetricProviderActivityScrapeErrors = prometheus.NewDesc(
+		"openrouter_provider_activity_scrape_errors_total",
+		"Number of provider-page fetch errors in the last refresh.",
+		nil, nil,
 	)
 )

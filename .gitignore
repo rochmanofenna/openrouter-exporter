@@ -1,3 +1,4 @@
 openrouter-exporter
 bin/
 .env
+.claude/

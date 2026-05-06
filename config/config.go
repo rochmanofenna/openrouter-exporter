@@ -19,6 +19,7 @@ type Config struct {
 	MetricsPath    string
 
 	ActivityModels         []string
+	ActivityProviders      []string
 	ActivitySessionCookie  string
 	ActivityScrapeInterval time.Duration
 }
@@ -84,6 +85,9 @@ func Load() (*Config, error) {
 	}
 	if v := os.Getenv("OPENROUTER_ACTIVITY_MODELS"); v != "" {
 		cfg.ActivityModels = strings.Split(v, ",")
+	}
+	if v := os.Getenv("OPENROUTER_ACTIVITY_PROVIDERS"); v != "" {
+		cfg.ActivityProviders = strings.Split(v, ",")
 	}
 	if v := os.Getenv("OPENROUTER_ACTIVITY_SCRAPE_INTERVAL"); v != "" {
 		d, err := time.ParseDuration(v)

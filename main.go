@@ -31,9 +31,14 @@ func main() {
 	apiClient := client.NewClient(cfg.BaseURL, cfg.APIKey, cfg.APITimeout, cfg.MaxConcurrency)
 	c := cache.New(apiClient, cfg.ScrapeInterval, logger)
 
-	if len(cfg.ActivityModels) > 0 && cfg.ActivitySessionCookie != "" {
+	if (len(cfg.ActivityModels) > 0 || len(cfg.ActivityProviders) > 0) && cfg.ActivitySessionCookie != "" {
 		c.SetActivityConfig(cfg.ActivityModels, cfg.ActivitySessionCookie, cfg.ActivityScrapeInterval)
-		logger.Info("activity scraping configured", "models", cfg.ActivityModels, "interval", cfg.ActivityScrapeInterval)
+		c.SetProviderActivity(cfg.ActivityProviders)
+		logger.Info("activity scraping configured",
+			"models", cfg.ActivityModels,
+			"providers", cfg.ActivityProviders,
+			"interval", cfg.ActivityScrapeInterval,
+		)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

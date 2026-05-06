@@ -47,6 +47,9 @@ func (c *OpenRouterCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- MetricActivityScrapeErrors
 	ch <- MetricActivityScrapeTimestamp
 	ch <- MetricActivityPromptTokens5mDelta
+	ch <- MetricProviderTokensDaily
+	ch <- MetricProviderTokensIntradayDelta
+	ch <- MetricProviderActivityScrapeErrors
 }
 
 func (c *OpenRouterCollector) Collect(ch chan<- prometheus.Metric) {
@@ -132,6 +135,39 @@ func (c *OpenRouterCollector) Collect(ch chan<- prometheus.Metric) {
 			float64(delta),
 			modelID,
 		)
+	}
+
+	// Provider chart series — one daily-total sample per (provider, model, date)
+	// covering the full ~20-day window the chart returns. Today's bucket is the
+	// running total so far and grows intraday.
+	if data.ProviderActivity != nil {
+		ch <- prometheus.MustNewConstMetric(MetricProviderActivityScrapeErrors, prometheus.GaugeValue, float64(data.ProviderActivityErrors))
+		for provider, points := range data.ProviderActivity {
+			for _, p := range points {
+				date := p.X
+				if len(date) >= 10 {
+					date = date[:10]
+				}
+				for modelID, tokens := range p.Ys {
+					ch <- prometheus.MustNewConstMetric(
+						MetricProviderTokensDaily,
+						prometheus.GaugeValue,
+						float64(tokens),
+						provider, modelID, date,
+					)
+				}
+			}
+		}
+	}
+	for provider, modelDeltas := range data.ProviderTokenDeltas {
+		for modelID, delta := range modelDeltas {
+			ch <- prometheus.MustNewConstMetric(
+				MetricProviderTokensIntradayDelta,
+				prometheus.GaugeValue,
+				float64(delta),
+				provider, modelID,
+			)
+		}
 	}
 }
 

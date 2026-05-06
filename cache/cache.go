@@ -21,6 +21,14 @@ type CachedData struct {
 	EndpointsCount int
 	ActivityErrors int
 	PromptTokenDeltas map[string]int64
+
+	// Provider-level chart series: provider slug -> [points]. Each point has
+	// a UTC date and a map of raw-model-id -> running token count for that day.
+	ProviderActivity map[string][]ProviderActivityPoint
+	// ProviderTokenDeltas[provider][modelID] = tokens added since last scrape
+	// to today's running bucket. Empty on first scrape (baseline).
+	ProviderTokenDeltas map[string]map[string]int64
+	ProviderActivityErrors int
 }
 
 // Re-export client types for cache consumers
@@ -28,6 +36,7 @@ type Model = client.Model
 type EndpointsResponse = client.EndpointsResponse
 type Endpoint = client.Endpoint
 type ActivityRecord = client.ActivityRecord
+type ProviderActivityPoint = client.ProviderActivityPoint
 
 type Cache struct {
 	mu                    sync.RWMutex
@@ -38,8 +47,15 @@ type Cache struct {
 	stopCh                chan struct{}
 	logger                *slog.Logger
 	activityModels        []string
+	activityProviders     []string
 	sessionCookie         string
 	prevPromptTokens      map[string]int64
+	// prevTodayTokens[provider][modelID] = today's running total seen on the
+	// previous scrape, used to compute intraday delta. The "today" bucket is
+	// the latest x in the chart; it grows during the day, resets at UTC
+	// midnight when a new bucket appears.
+	prevTodayTokens       map[string]map[string]int64
+	prevTodayDate         map[string]string // provider -> date of the bucket prevTodayTokens belongs to
 }
 
 func New(c *client.OpenRouterClient, interval time.Duration, logger *slog.Logger) *Cache {
@@ -55,6 +71,10 @@ func (c *Cache) SetActivityConfig(models []string, sessionCookie string, interva
 	c.activityModels = models
 	c.sessionCookie = sessionCookie
 	c.activityInterval = interval
+}
+
+func (c *Cache) SetProviderActivity(providers []string) {
+	c.activityProviders = providers
 }
 
 func (c *Cache) Start(ctx context.Context) error {
@@ -148,10 +168,30 @@ func (c *Cache) refresh(ctx context.Context) error {
 		}
 	}
 
+	// Fetch provider chart data if configured
+	var provDeltas map[string]map[string]int64
+	var newProvPrev map[string]map[string]int64
+	var newProvDate map[string]string
+	if len(c.activityProviders) > 0 && c.sessionCookie != "" {
+		provResult, err := c.client.FetchAllProviderActivity(ctx, c.activityProviders, c.sessionCookie)
+		if err != nil {
+			c.logger.Error("fetch provider activity failed", "error", err)
+		} else {
+			cached.ProviderActivity = provResult.Activity
+			cached.ProviderActivityErrors = provResult.Errors
+			provDeltas, newProvPrev, newProvDate = computeProviderTokenDeltas(provResult.Activity, c.prevTodayTokens, c.prevTodayDate)
+			cached.ProviderTokenDeltas = provDeltas
+		}
+	}
+
 	c.mu.Lock()
 	c.data = cached
 	if newPrev != nil {
 		c.prevPromptTokens = newPrev
+	}
+	if newProvPrev != nil {
+		c.prevTodayTokens = newProvPrev
+		c.prevTodayDate = newProvDate
 	}
 	c.mu.Unlock()
 
@@ -178,18 +218,46 @@ func (c *Cache) refreshActivity(ctx context.Context) {
 
 	deltas, newPrev := computePromptTokenDeltas(activityResult.Activity, c.prevPromptTokens)
 
+	// Provider chart fetch (independent — failure here doesn't kill the per-model path)
+	var provActivity map[string][]ProviderActivityPoint
+	var provErrors int
+	var provDeltas map[string]map[string]int64
+	var newProvPrev map[string]map[string]int64
+	var newProvDate map[string]string
+	if len(c.activityProviders) > 0 {
+		provResult, perr := c.client.FetchAllProviderActivity(ctx, c.activityProviders, c.sessionCookie)
+		if perr != nil {
+			c.logger.Error("provider activity refresh failed", "error", perr)
+		} else {
+			provActivity = provResult.Activity
+			provErrors = provResult.Errors
+			provDeltas, newProvPrev, newProvDate = computeProviderTokenDeltas(provResult.Activity, c.prevTodayTokens, c.prevTodayDate)
+		}
+	}
+
 	c.mu.Lock()
 	if c.data != nil {
 		c.data.Activity = activityResult.Activity
 		c.data.ActivityErrors = activityResult.Errors
 		c.data.PromptTokenDeltas = deltas
+		if provActivity != nil {
+			c.data.ProviderActivity = provActivity
+			c.data.ProviderActivityErrors = provErrors
+			c.data.ProviderTokenDeltas = provDeltas
+		}
 	}
 	c.prevPromptTokens = newPrev
+	if newProvPrev != nil {
+		c.prevTodayTokens = newProvPrev
+		c.prevTodayDate = newProvDate
+	}
 	c.mu.Unlock()
 
 	c.logger.Info("activity refreshed",
 		"models", len(activityResult.Activity),
 		"errors", activityResult.Errors,
+		"providers", len(provActivity),
+		"provider_errors", provErrors,
 	)
 }
 
@@ -213,6 +281,86 @@ func latestDayPromptTokens(records []ActivityRecord) (int64, bool) {
 		}
 	}
 	return total, true
+}
+
+// latestPoint returns the chart point with the largest x value, which is
+// today's running bucket. Returns nil if the series is empty.
+func latestPoint(series []ProviderActivityPoint) *ProviderActivityPoint {
+	if len(series) == 0 {
+		return nil
+	}
+	idx := 0
+	for i := 1; i < len(series); i++ {
+		if series[i].X > series[idx].X {
+			idx = i
+		}
+	}
+	return &series[idx]
+}
+
+// computeProviderTokenDeltas computes intraday deltas of today's running token
+// counts per (provider, model) since the previous scrape. Returns empty deltas
+// on the first scrape (only seeds prev), and zero (not negative) on UTC
+// midnight rollover when a new "today" bucket appears.
+func computeProviderTokenDeltas(
+	activity map[string][]ProviderActivityPoint,
+	prev map[string]map[string]int64,
+	prevDate map[string]string,
+) (map[string]map[string]int64, map[string]map[string]int64, map[string]string) {
+	deltas := make(map[string]map[string]int64, len(activity))
+	newPrev := make(map[string]map[string]int64, len(activity))
+	newDate := make(map[string]string, len(activity))
+
+	for provider, series := range activity {
+		latest := latestPoint(series)
+		if latest == nil {
+			continue
+		}
+		todayDate := latest.X
+		if len(todayDate) >= 10 {
+			todayDate = todayDate[:10]
+		}
+
+		// Snapshot the latest ys so the next scrape can diff against it.
+		snap := make(map[string]int64, len(latest.Ys))
+		for k, v := range latest.Ys {
+			snap[k] = v
+		}
+		newPrev[provider] = snap
+		newDate[provider] = todayDate
+
+		// First scrape, or rollover to a new day: emit no deltas (baseline only).
+		if prev == nil {
+			continue
+		}
+		pPrev, ok := prev[provider]
+		if !ok {
+			continue
+		}
+		if prevDate != nil && prevDate[provider] != todayDate {
+			// New day — yesterday's bucket finalized. Skip emitting deltas
+			// this tick to avoid an artificial spike.
+			continue
+		}
+
+		modelDeltas := make(map[string]int64, len(latest.Ys))
+		for modelID, cur := range latest.Ys {
+			p, had := pPrev[modelID]
+			if !had {
+				continue // model just appeared
+			}
+			d := cur - p
+			if d < 0 {
+				d = 0 // late-arriving correction; clamp
+			}
+			modelDeltas[modelID] = d
+		}
+		if len(modelDeltas) > 0 {
+			deltas[provider] = modelDeltas
+		}
+	}
+
+	return deltas, newPrev, newDate
 }
 
 // computePromptTokenDeltas returns per-model deltas of total_prompt_tokens
