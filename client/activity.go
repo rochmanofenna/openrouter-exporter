@@ -14,6 +14,7 @@ type ActivityRecord struct {
 	Date                       string `json:"date"`
 	ModelPermaslug             string `json:"model_permaslug"`
 	Variant                    string `json:"variant"`
+	Category                   string `json:"category"`
 	TotalCompletionTokens      int64  `json:"total_completion_tokens"`
 	TotalPromptTokens          int64  `json:"total_prompt_tokens"`
 	TotalNativeTokensReasoning int64  `json:"total_native_tokens_reasoning"`
@@ -30,7 +31,7 @@ type ActivityFetchResult struct {
 
 const (
 	rscHeader             = "1"
-	analyticsJSONArrayKey = `"analytics":[`
+	analyticsJSONArrayKey = `"categories":[`
 )
 
 func (c *OpenRouterClient) FetchActivity(ctx context.Context, modelSlug, sessionCookie string) ([]ActivityRecord, error) {

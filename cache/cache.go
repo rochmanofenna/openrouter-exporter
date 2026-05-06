@@ -193,17 +193,26 @@ func (c *Cache) refreshActivity(ctx context.Context) {
 	)
 }
 
-func latestRecord(records []ActivityRecord) *ActivityRecord {
+// latestDayPromptTokens sums total_prompt_tokens across all records that share
+// the most recent date. The activity API now returns one record per category,
+// so a single record is just one slice of the day, not the full daily total.
+func latestDayPromptTokens(records []ActivityRecord) (int64, bool) {
 	if len(records) == 0 {
-		return nil
+		return 0, false
 	}
-	idx := 0
+	maxDate := records[0].Date
 	for i := 1; i < len(records); i++ {
-		if records[i].Date > records[idx].Date {
-			idx = i
+		if records[i].Date > maxDate {
+			maxDate = records[i].Date
 		}
 	}
-	return &records[idx]
+	var total int64
+	for i := range records {
+		if records[i].Date == maxDate {
+			total += records[i].TotalPromptTokens
+		}
+	}
+	return total, true
 }
 
 // computePromptTokenDeltas returns per-model deltas of total_prompt_tokens
@@ -215,11 +224,11 @@ func computePromptTokenDeltas(activity map[string][]ActivityRecord, prev map[str
 	newPrev := make(map[string]int64, len(activity))
 
 	for modelID, records := range activity {
-		latest := latestRecord(records)
-		if latest == nil {
+		latest, ok := latestDayPromptTokens(records)
+		if !ok {
 			continue
 		}
-		newPrev[modelID] = latest.TotalPromptTokens
+		newPrev[modelID] = latest
 
 		if prev == nil {
 			continue
@@ -228,9 +237,9 @@ func computePromptTokenDeltas(activity map[string][]ActivityRecord, prev map[str
 		if !ok {
 			continue
 		}
-		d := latest.TotalPromptTokens - p
+		d := latest - p
 		if d < 0 {
-			d = latest.TotalPromptTokens
+			d = latest
 		}
 		deltas[modelID] = d
 	}
