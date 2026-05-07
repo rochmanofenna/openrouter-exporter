@@ -84,8 +84,11 @@ print(f"Pulling {LOOKBACK_H}h of history: {START.isoformat()} → {END.isoformat
 
 # Target: per-30-min token delta of the daily running total.
 # delta() handles UTC-midnight resets cleanly (negative values get filtered below).
+# Sum across the `date` label to collapse the ~14 simultaneously-active daily
+# series per model down to one. Finalized historical dates contribute 0 deltas;
+# today's bucket contributes real movement.
 target_q = (
-    f'delta(openrouter_provider_tokens_daily{{provider="{PROVIDER}"}}[30m])'
+    f'sum by (model_id) (delta(openrouter_provider_tokens_daily{{provider="{PROVIDER}"}}[30m]))'
 )
 target_df = prom_range(target_q, START, END, STEP_SECONDS)
 
