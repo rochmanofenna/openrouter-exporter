@@ -56,6 +56,8 @@ def load_daily_csv(path: Path) -> pd.DataFrame:
         lines = f.readlines()
     header_idx = next(i for i, line in enumerate(lines) if line.startswith("Date,"))
     df = pd.read_csv(path, skiprows=header_idx)
+    # Drop the trailing "TOTAL" summary row that the dashboard appends
+    df = df[df["Date"].astype(str).str.match(r"\d{4}-\d{2}-\d{2}")].copy()
     df["Date"] = pd.to_datetime(df["Date"])
     return df
 
