@@ -236,6 +236,30 @@ feature_cols = [c for c in feat.columns
                 and feat[c].dtype != "object"]
 cat_cols = ["model_idx", "dow", "is_weekend"]
 
+def train_lgbm(target: str, train: pd.DataFrame, test: pd.DataFrame
+               ) -> tuple[pd.DataFrame, np.ndarray] | tuple[None, None]:
+    """Fit LightGBM on log1p(target). Returns (test rows used, predictions in original scale)."""
+    tr = train.dropna(subset=[f"{target}__lag1"])
+    te = test.dropna(subset=[f"{target}__lag1"]).copy()
+    if len(tr) < 20 or len(te) == 0:
+        return None, None
+    y_tr = np.log1p(tr[target].clip(lower=0).to_numpy(dtype=float))
+    X_tr = tr[feature_cols].fillna(-1)
+    X_te = te[feature_cols].fillna(-1)
+    model = LGBMRegressor(
+        objective="regression",
+        num_leaves=15,
+        n_estimators=400,
+        learning_rate=0.05,
+        min_data_in_leaf=3,
+        feature_fraction=0.8,
+        verbose=-1,
+    )
+    model.fit(X_tr, y_tr, categorical_feature=cat_cols)
+    y_pred = np.expm1(np.clip(model.predict(X_te), 0, None))
+    return te, y_pred
+
+
 results: list[Result] = []
 
 for target in TARGETS:
@@ -249,7 +273,7 @@ for target in TARGETS:
         snaive = test[f"{target}__lag7"].fillna(test[f"{target}__lag1"]).fillna(test[target].median()).to_numpy()
         results += evaluate(target, "lag7_naive", test, snaive)
 
-        # 3-day rolling average
+        # 3-day rolling average (meaningful for tokens; falls back to lag1 for other targets)
         ravg = test["tokens_roll3_mean"].fillna(test[f"{target}__lag1"]).to_numpy() if target == "Total Tokens" \
                else test[f"{target}__lag1"].fillna(test[target].median()).to_numpy()
         results += evaluate(target, "roll3_mean", test, ravg)
@@ -257,33 +281,30 @@ for target in TARGETS:
         if not HAVE_LGB:
             continue
 
-        tr = train.dropna(subset=[f"{target}__lag1"])
-        te = test.dropna(subset=[f"{target}__lag1"]).copy()
-        if len(tr) < 20 or len(te) == 0:
+        # LightGBM directly for tokens and requests; cost is derived below.
+        if target == "Total Cost":
             continue
 
-        y_tr = np.log1p(tr[target].clip(lower=0).to_numpy(dtype=float))
-        X_tr = tr[feature_cols].fillna(-1)
-        X_te = te[feature_cols].fillna(-1)
-
-        # Recency weighting: last 7 days of the training set carry 3x weight.
-        # Helps the model favor the current regime in a growth phase.
-        recent_cutoff = tr["Date"].max() - pd.Timedelta(days=7)
-        weights = np.where(tr["Date"] >= recent_cutoff, 3.0, 1.0)
-
-        model = LGBMRegressor(
-            objective="regression",
-            num_leaves=15,
-            n_estimators=400,
-            learning_rate=0.05,
-            min_data_in_leaf=3,
-            feature_fraction=0.8,
-            verbose=-1,
-        )
-        model.fit(X_tr, y_tr, sample_weight=weights, categorical_feature=cat_cols)
-        y_pred_log = model.predict(X_te)
-        y_pred = np.expm1(np.clip(y_pred_log, 0, None))
+        te, y_pred = train_lgbm(target, train, test)
+        if te is None:
+            continue
         results += evaluate(target, "lightgbm", te, y_pred)
+
+    # Derived cost: predict tokens, multiply by yesterday's per-token cost.
+    # Cleaner than training LGBM directly on cost because cost = tokens × rate
+    # and the rate is very stable per model, while only the volume varies.
+    if HAVE_LGB and target == "Total Cost":
+        for train, test in walk_forward_splits(feat, n_splits=5, train_frac=0.5):
+            te, tok_pred = train_lgbm("Total Tokens", train, test)
+            if te is None:
+                continue
+            # cost_per_token_lag1 = Total Cost / Total Tokens, both from yesterday.
+            # Fallback to model-wise median if lag is NaN.
+            rate = te["cost_per_token_lag1"].copy()
+            med_rate = te.groupby("Model")["cost_per_token_lag1"].transform("median")
+            rate = rate.fillna(med_rate).fillna(rate.median()).to_numpy()
+            cost_pred = tok_pred * rate
+            results += evaluate("Total Cost", "derived_from_tokens", te, cost_pred)
 
 res_df = pd.DataFrame([r.__dict__ for r in results])
 if res_df.empty:
@@ -356,40 +377,56 @@ def make_inference_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Timestamp]:
     return build_features(full), next_date
 
 
+def fit_predict_final(target: str, inf_rows: pd.DataFrame) -> np.ndarray | None:
+    """Retrain LightGBM on all historical data, predict for inference rows."""
+    tr = feat.dropna(subset=[f"{target}__lag1"])
+    if len(tr) < 20:
+        return None
+    y_tr = np.log1p(tr[target].clip(lower=0).to_numpy(dtype=float))
+    X_tr = tr[feature_cols].fillna(-1)
+    X_inf = inf_rows[feature_cols].fillna(-1)
+    model = LGBMRegressor(
+        objective="regression",
+        num_leaves=15,
+        n_estimators=400,
+        learning_rate=0.05,
+        min_data_in_leaf=3,
+        feature_fraction=0.8,
+        verbose=-1,
+    )
+    model.fit(X_tr, y_tr, categorical_feature=cat_cols)
+    return np.expm1(np.clip(model.predict(X_inf), 0, None))
+
+
 next_day_predictions: list[dict] = []
 if HAVE_LGB:
     inf_feat, next_date = make_inference_frame(df)
-    inf_rows = inf_feat[inf_feat["Date"] == next_date]
+    inf_rows = inf_feat[inf_feat["Date"] == next_date].copy()
 
     print(f"\n=== Next-day forecast for {next_date.date()} ===\n")
-    for target in TARGETS:
-        tr = feat.dropna(subset=[f"{target}__lag1"])
-        if len(tr) < 20:
-            continue
-        y_tr = np.log1p(tr[target].clip(lower=0).to_numpy(dtype=float))
-        X_tr = tr[feature_cols].fillna(-1)
-        X_inf = inf_rows[feature_cols].fillna(-1)
 
-        recent_cutoff = tr["Date"].max() - pd.Timedelta(days=7)
-        weights = np.where(tr["Date"] >= recent_cutoff, 3.0, 1.0)
+    # Train direct models for tokens and requests
+    pred_by_target: dict[str, np.ndarray] = {}
+    for target in ["Total Tokens", "Requests"]:
+        y_pred = fit_predict_final(target, inf_rows)
+        if y_pred is not None:
+            pred_by_target[target] = y_pred
 
-        model = LGBMRegressor(
-            objective="regression",
-            num_leaves=15,
-            n_estimators=400,
-            learning_rate=0.05,
-            min_data_in_leaf=3,
-            feature_fraction=0.8,
-            verbose=-1,
-        )
-        model.fit(X_tr, y_tr, sample_weight=weights, categorical_feature=cat_cols)
-        y_pred = np.expm1(np.clip(model.predict(X_inf), 0, None))
+    # Derive cost = predicted tokens × yesterday's per-token rate
+    if "Total Tokens" in pred_by_target:
+        rate = inf_rows["cost_per_token_lag1"].copy()
+        med_rate = inf_rows.groupby("Model")["cost_per_token_lag1"].transform("median")
+        rate = rate.fillna(med_rate).fillna(rate.median()).to_numpy()
+        pred_by_target["Total Cost"] = pred_by_target["Total Tokens"] * rate
 
-        for m, p in zip(inf_rows["Model"], y_pred):
-            next_day_predictions.append({"Date": next_date.date(), "Model": m, target: p})
+    # Assemble per-model rows
+    for i, m in enumerate(inf_rows["Model"].to_numpy()):
+        row = {"Date": next_date.date(), "Model": m}
+        for target, arr in pred_by_target.items():
+            row[target] = float(arr[i])
+        next_day_predictions.append(row)
 
-    pred_df = pd.DataFrame(next_day_predictions).groupby(["Date", "Model"], as_index=False).first()
-    pred_df = pred_df.sort_values("Total Tokens", ascending=False)
+    pred_df = pd.DataFrame(next_day_predictions).sort_values("Total Tokens", ascending=False)
     print(pred_df.to_string(index=False))
     pred_df.to_csv(OUT / "forecast_v2_next_day.csv", index=False)
 
