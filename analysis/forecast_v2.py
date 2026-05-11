@@ -266,6 +266,11 @@ for target in TARGETS:
         X_tr = tr[feature_cols].fillna(-1)
         X_te = te[feature_cols].fillna(-1)
 
+        # Recency weighting: last 7 days of the training set carry 3x weight.
+        # Helps the model favor the current regime in a growth phase.
+        recent_cutoff = tr["Date"].max() - pd.Timedelta(days=7)
+        weights = np.where(tr["Date"] >= recent_cutoff, 3.0, 1.0)
+
         model = LGBMRegressor(
             objective="regression",
             num_leaves=15,
@@ -275,7 +280,7 @@ for target in TARGETS:
             feature_fraction=0.8,
             verbose=-1,
         )
-        model.fit(X_tr, y_tr, categorical_feature=cat_cols)
+        model.fit(X_tr, y_tr, sample_weight=weights, categorical_feature=cat_cols)
         y_pred_log = model.predict(X_te)
         y_pred = np.expm1(np.clip(y_pred_log, 0, None))
         results += evaluate(target, "lightgbm", te, y_pred)
@@ -365,6 +370,9 @@ if HAVE_LGB:
         X_tr = tr[feature_cols].fillna(-1)
         X_inf = inf_rows[feature_cols].fillna(-1)
 
+        recent_cutoff = tr["Date"].max() - pd.Timedelta(days=7)
+        weights = np.where(tr["Date"] >= recent_cutoff, 3.0, 1.0)
+
         model = LGBMRegressor(
             objective="regression",
             num_leaves=15,
@@ -374,7 +382,7 @@ if HAVE_LGB:
             feature_fraction=0.8,
             verbose=-1,
         )
-        model.fit(X_tr, y_tr, categorical_feature=cat_cols)
+        model.fit(X_tr, y_tr, sample_weight=weights, categorical_feature=cat_cols)
         y_pred = np.expm1(np.clip(model.predict(X_inf), 0, None))
 
         for m, p in zip(inf_rows["Model"], y_pred):
