@@ -77,6 +77,27 @@ frames = [load_daily_csv(Path(p)) for p in csv_paths]
 df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["Date", "Model"])
 df = df.sort_values(["Model", "Date"]).reset_index(drop=True)
 
+
+def drop_partial_last_day(df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFrame:
+    """If the latest date's volume is < threshold * 7-day median for any model,
+    treat it as a partial-day CSV export and drop it. Otherwise return as-is."""
+    last_date = df["Date"].max()
+    last_day = df[df["Date"] == last_date]
+    earlier = df[df["Date"] < last_date]
+    if earlier.empty:
+        return df
+    medians = earlier.groupby("Model")["Total Tokens"].median()
+    for _, row in last_day.iterrows():
+        m = row["Model"]
+        if m in medians.index and row["Total Tokens"] < threshold * medians[m]:
+            print(f"  [skip] {last_date.date()} appears partial "
+                  f"({m}: {row['Total Tokens']:.2e} vs {medians[m]:.2e} median) — dropping")
+            return df[df["Date"] < last_date].copy()
+    return df
+
+
+df = drop_partial_last_day(df)
+
 # Coerce numerics (CSV quoted everything as strings)
 for c in ["Requests", "Input Tokens", "Output Tokens", "Cached Tokens",
           "Total Tokens", "Input Cost", "Output Cost", "Total Cost"]:
