@@ -48,6 +48,11 @@ OUT.mkdir(parents=True, exist_ok=True)
 
 TARGETS = ["Total Tokens", "Requests", "Total Cost"]
 
+# How many days back from the train-window's end to use for LGBM fitting.
+# Keeps the model focused on the current regime; older April low-volume days
+# were anchoring predictions toward the median and producing under-estimates.
+TRAIN_LOOKBACK_DAYS = int(os.environ.get("TRAIN_LOOKBACK_DAYS", "14"))
+
 
 # %% Load and concatenate the daily CSVs
 def load_daily_csv(path: Path) -> pd.DataFrame:
@@ -97,6 +102,14 @@ def drop_partial_last_day(df: pd.DataFrame, threshold: float = 0.5) -> pd.DataFr
 
 
 df = drop_partial_last_day(df)
+
+# Drop hidden z-ai models — the dashboard has them set to Hidden status
+# (since ~2026-04-15 / 2026-05-07 respectively) so they no longer serve
+# traffic. Training on the trailing zeros pollutes the model.
+zai_mask = df["Model"].str.startswith("z-ai/")
+if zai_mask.any():
+    print(f"  [drop] {zai_mask.sum()} z-ai/* rows (hidden models)")
+    df = df[~zai_mask].copy()
 
 # Coerce numerics (CSV quoted everything as strings)
 for c in ["Requests", "Input Tokens", "Output Tokens", "Cached Tokens",
@@ -239,7 +252,10 @@ cat_cols = ["model_idx", "dow", "is_weekend"]
 def train_lgbm(target: str, train: pd.DataFrame, test: pd.DataFrame
                ) -> tuple[pd.DataFrame, np.ndarray] | tuple[None, None]:
     """Fit LightGBM on log1p(target). Returns (test rows used, predictions in original scale)."""
-    tr = train.dropna(subset=[f"{target}__lag1"])
+    # Restrict training to the most recent TRAIN_LOOKBACK_DAYS so the model
+    # doesn't get anchored to early-April low-volume days.
+    cutoff = train["Date"].max() - pd.Timedelta(days=TRAIN_LOOKBACK_DAYS)
+    tr = train[train["Date"] >= cutoff].dropna(subset=[f"{target}__lag1"])
     te = test.dropna(subset=[f"{target}__lag1"]).copy()
     if len(tr) < 20 or len(te) == 0:
         return None, None
@@ -378,8 +394,9 @@ def make_inference_frame(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Timestamp]:
 
 
 def fit_predict_final(target: str, inf_rows: pd.DataFrame) -> np.ndarray | None:
-    """Retrain LightGBM on all historical data, predict for inference rows."""
-    tr = feat.dropna(subset=[f"{target}__lag1"])
+    """Retrain LightGBM on the last TRAIN_LOOKBACK_DAYS, predict for inference rows."""
+    cutoff = feat["Date"].max() - pd.Timedelta(days=TRAIN_LOOKBACK_DAYS)
+    tr = feat[feat["Date"] >= cutoff].dropna(subset=[f"{target}__lag1"])
     if len(tr) < 20:
         return None
     y_tr = np.log1p(tr[target].clip(lower=0).to_numpy(dtype=float))
@@ -419,11 +436,22 @@ if HAVE_LGB:
         rate = rate.fillna(med_rate).fillna(rate.median()).to_numpy()
         pred_by_target["Total Cost"] = pred_by_target["Total Tokens"] * rate
 
+    # Persistence baseline = yesterday's actual value (= lag_1 at the inference row).
+    # On May 12 validation this beat LGBM by a wide margin during the growth phase,
+    # so it's worth carrying as a sanity-check forecast alongside the ML predictions.
+    persistence_by_target = {
+        "Total Tokens (persistence)":  inf_rows["Total Tokens__lag1"].fillna(0).to_numpy(),
+        "Requests (persistence)":      inf_rows["Requests__lag1"].fillna(0).to_numpy(),
+        "Total Cost (persistence)":    inf_rows["Total Cost__lag1"].fillna(0).to_numpy(),
+    }
+
     # Assemble per-model rows
     for i, m in enumerate(inf_rows["Model"].to_numpy()):
         row = {"Date": next_date.date(), "Model": m}
         for target, arr in pred_by_target.items():
             row[target] = float(arr[i])
+        for col, arr in persistence_by_target.items():
+            row[col] = float(arr[i])
         next_day_predictions.append(row)
 
     pred_df = pd.DataFrame(next_day_predictions).sort_values("Total Tokens", ascending=False)
