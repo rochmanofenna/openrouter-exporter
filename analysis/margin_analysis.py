@@ -237,20 +237,20 @@ def per_model_economics(model_id: str, history: pd.DataFrame) -> dict | None:
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
-def fmt_money(v: float) -> str:
-    if v != v:  # NaN
+def fmt_money(v) -> str:
+    if v is None or (isinstance(v, float) and v != v):  # None or NaN
         return "—"
     return f"${v:,.2f}"
 
 
-def fmt_int(v: float) -> str:
-    if v != v:
+def fmt_int(v) -> str:
+    if v is None or (isinstance(v, float) and v != v):
         return "—"
     return f"{v:,.0f}"
 
 
-def fmt_pct(v: float) -> str:
-    if v != v:
+def fmt_pct(v) -> str:
+    if v is None or (isinstance(v, float) and v != v):
         return "—"
     return f"{v*100:+.1f}%"
 
