@@ -214,36 +214,59 @@ def get_levers_for_model(model_id: str, name_map: dict[str, str]) -> tuple[pd.Da
 # Pull recent market share
 # ----------------------------------------------------------------------------
 def get_market_share(model_id: str, days: int = 7) -> dict[str, float]:
-    """Return per-slug average share over the last `days` days."""
+    """Per-provider share averaged over fully-overlapping finalized UTC days.
+
+    Earlier versions averaged each provider's share across that provider's own
+    available dates, which produced incoherent results when providers had
+    different history depth (e.g. competitor avg over 90 days vs DekaLLM over
+    32 days made the per-model shares sum to >100%).
+
+    This version:
+    1. Finds every provider that had any data in the lookback window.
+    2. Keeps only dates where ALL of those providers had data.
+    3. Drops today's still-in-progress UTC day.
+    4. Computes each provider's share per common date, then averages.
+
+    Result: shares sum to ~100% per model, comparable across providers.
+    """
     end = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    start = end - timedelta(days=days)
+    # Look back days+1 so we have headroom after dropping today
+    start = end - timedelta(days=days + 1)
     q = f'openrouter_provider_tokens_daily{{model_id="{model_id}"}}'
     series = prom_range(q, start, end, 3600)
 
-    per_provider_date: dict[tuple[str, str], float] = {}
+    # (provider, date) -> max running-total seen during the window
+    per_pd: dict[tuple[str, str], float] = {}
     for s in series:
         provider = s["metric"].get("provider", "")
         date = s["metric"].get("date", "")
         if not date or not provider:
             continue
-        max_val = max(float(v[1]) for v in s["values"])
-        per_provider_date[(provider, date)] = max(max_val, per_provider_date.get((provider, date), 0))
+        v = max(float(v[1]) for v in s["values"])
+        per_pd[(provider, date)] = max(v, per_pd.get((provider, date), 0))
 
-    # Sum per (provider, date) is already in per_provider_date
-    # Compute per-day total then per-day share, then average shares
-    dates = sorted({d for _, d in per_provider_date})
-    if not dates:
-        return {p: 0.0 for p in PROVIDERS_SLUGS}
+    if not per_pd:
+        return {}
 
-    per_day_total: dict[str, float] = {}
-    for (p, d), v in per_provider_date.items():
-        per_day_total[d] = per_day_total.get(d, 0) + v
+    providers_in_window = {p for (p, _) in per_pd.keys()}
+    dates_per_provider: dict[str, set[str]] = {p: set() for p in providers_in_window}
+    for (p, d), _v in per_pd.items():
+        dates_per_provider[p].add(d)
+    common_dates = set.intersection(*dates_per_provider.values()) if dates_per_provider else set()
+    today_iso = datetime.now(timezone.utc).date().isoformat()
+    common_dates = sorted(d for d in common_dates if d < today_iso)
+    if not common_dates:
+        # No overlap — fall back to "just today's finalized share if it exists"
+        # by reporting empty (caller defaults missing keys to 0).
+        return {}
 
-    shares: dict[str, list[float]] = {}
-    for (p, d), v in per_provider_date.items():
-        total = per_day_total.get(d, 0)
-        if total > 0:
-            shares.setdefault(p, []).append(v / total)
+    shares: dict[str, list[float]] = {p: [] for p in providers_in_window}
+    for d in common_dates:
+        total = sum(per_pd.get((p, d), 0.0) for p in providers_in_window)
+        if total <= 0:
+            continue
+        for p in providers_in_window:
+            shares[p].append(per_pd.get((p, d), 0.0) / total)
 
     return {p: (sum(vs) / len(vs)) if vs else 0.0 for p, vs in shares.items()}
 
