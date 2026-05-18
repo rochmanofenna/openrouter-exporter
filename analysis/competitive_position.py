@@ -39,6 +39,7 @@ Env:
 from __future__ import annotations
 
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -138,8 +139,25 @@ def get_dekallm_models() -> list[str]:
 # ----------------------------------------------------------------------------
 # Pull lever values per (provider, model_id)
 # ----------------------------------------------------------------------------
-def get_levers_for_model(model_id: str, name_map: dict[str, str]) -> pd.DataFrame:
-    """Return a DataFrame indexed by provider_slug with columns for each lever."""
+_DATE_SUFFIX = re.compile(r"-\d{8}$")
+
+
+def candidate_endpoint_model_ids(permaslug: str) -> list[str]:
+    """OpenRouter chart metrics use permaslugs with -YYYYMMDD date suffixes
+    (e.g. google/gemma-4-26b-a4b-it-20260403). Endpoint metrics from the
+    public /api/v1/models scrape use the base slug without the date.
+    Return candidates to try, in priority order."""
+    candidates = [permaslug]
+    stripped = _DATE_SUFFIX.sub("", permaslug)
+    if stripped != permaslug:
+        candidates.append(stripped)
+    return candidates
+
+
+def get_levers_for_model(model_id: str, name_map: dict[str, str]) -> tuple[pd.DataFrame, str | None]:
+    """Return (DataFrame, resolved_endpoint_slug). The slug may differ from
+    model_id if endpoint metrics use the base form. Returns (None, None) if
+    no endpoint data found for any candidate slug."""
     queries = {
         "input_price":  ("min", "openrouter_model_input_price_dollars_per_million_tokens", ""),
         "output_price": ("min", "openrouter_model_output_price_dollars_per_million_tokens", ""),
@@ -151,9 +169,26 @@ def get_levers_for_model(model_id: str, name_map: dict[str, str]) -> pd.DataFram
     # Build reverse map name->slug
     name_to_slug = {v: k for k, v in name_map.items() if v}
 
+    # Try permaslug first, fall back to base slug if no data
+    resolved_slug = None
+    for candidate in candidate_endpoint_model_ids(model_id):
+        # Probe with a cheap query first
+        probe = prom_query(
+            f'openrouter_model_input_price_dollars_per_million_tokens{{model_id="{candidate}"}}'
+        )
+        if probe:
+            resolved_slug = candidate
+            break
+
+    if resolved_slug is None:
+        # No endpoint data at all for any candidate slug
+        df = pd.DataFrame(columns=list(queries.keys()))
+        df.index.name = "provider"
+        return df, None
+
     metrics: dict[str, dict[str, float]] = {}
     for col, (agg, base, qfilter) in queries.items():
-        q = f'{agg} by (provider_name) ({base}{{model_id="{model_id}"{qfilter}}})'
+        q = f'{agg} by (provider_name) ({base}{{model_id="{resolved_slug}"{qfilter}}})'
         try:
             res = prom_query(q)
         except Exception:
@@ -172,7 +207,7 @@ def get_levers_for_model(model_id: str, name_map: dict[str, str]) -> pd.DataFram
     for col in queries:
         if col not in df.columns:
             df[col] = float("nan")
-    return df[list(queries.keys())]
+    return df[list(queries.keys())], resolved_slug
 
 
 # ----------------------------------------------------------------------------
@@ -271,10 +306,13 @@ def fmt_value(col: str, v: float) -> str:
     return f"{v:.3f}"
 
 
-def per_model_report(model_id: str, df: pd.DataFrame, share: dict[str, float]) -> str:
+def per_model_report(model_id: str, df: pd.DataFrame, share: dict[str, float],
+                     resolved_slug: str | None = None) -> str:
     """Return a markdown chunk for one model."""
     out = []
     out.append(f"## {model_id}\n")
+    if resolved_slug and resolved_slug != model_id:
+        out.append(f"_Endpoint metrics matched as `{resolved_slug}` (date suffix stripped from permaslug)._\n")
 
     # Show DekaLLM's share + total
     dek_share = share.get(DEKALLM_SLUG, 0.0) * 100
@@ -440,16 +478,17 @@ def main() -> None:
     model_data = {}
     sections = []
     for model_id in dek_models:
-        levers = get_levers_for_model(model_id, name_map)
+        levers, resolved = get_levers_for_model(model_id, name_map)
         if levers.empty or levers.isna().all().all():
-            print(f"  {model_id}: no lever data (likely DekaLLM-only or unscraped)")
+            print(f"  {model_id}: no lever data (no endpoint metrics found for any candidate slug)")
             continue
         for col in LEVER_LABELS:
             levers = rank_and_gap(levers, col)
         share = get_market_share(model_id)
-        model_data[model_id] = {"levers": levers, "share": share}
-        sections.append(per_model_report(model_id, levers, share))
-        print(f"  {model_id}: {len(levers)} providers compared")
+        model_data[model_id] = {"levers": levers, "share": share, "resolved_slug": resolved}
+        sections.append(per_model_report(model_id, levers, share, resolved))
+        slug_note = f" (matched as '{resolved}')" if resolved and resolved != model_id else ""
+        print(f"  {model_id}: {len(levers)} providers compared{slug_note}")
 
     summary = overall_summary(model_data)
 
