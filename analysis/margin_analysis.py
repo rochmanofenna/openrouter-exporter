@@ -1,244 +1,250 @@
 """Per-model margin analysis for DekaLLM under different GPU configurations.
 
-Compares the current L40S setup against a hypothetical H100 swap. For each
-model DekaLLM serves, computes:
+Now sourced from the analytics API. Revenue comes from joining DekaLLM's
+daily token volume (`/db/providers/dekallm/tokens`) with the pricing on each
+provider endpoint (`/scrape/models/{slug}/details`). Throughput likewise
+comes from the model details payload. The script also calls the planner's
+`/planner/compute` endpoint with DekaLLM's actual GPU pricing as overrides
+and shows the two views side-by-side as a sanity check.
 
-- Revenue/day: from CSV historical actuals (gross, then net after OR's 15% fee)
-- GPU cost/day: assumed $/GPU/hr × estimated GPUs in service
-- Current margin: net revenue − GPU cost
-- Projected H100 margin: using a configurable throughput multiplier and
-  the lever-sensitivity regression's throughput slope to estimate share lift
-
-The analysis is sensitive to several assumptions you should set explicitly
-(see the CONFIG block). Defaults are 2026-era industry rentals; replace with
-DekaLLM's actual contracted prices for the real number.
+Defaults reflect DekaLLM's actual contracted rates (Ryan confirmed
+2026-05-15): $1.00/hr L40S, $2.00/hr H100. Override any of these via env
+vars.
 
 Usage:
     python analysis/margin_analysis.py
 
-Env knobs (all optional):
-    L40S_PER_HR              default 1.40   (USD per GPU per hour)
-    H100_PER_HR              default 3.00   (USD per GPU per hour)
-    H100_THROUGHPUT_X        default 3.0    (H100 throughput multiplier vs L40S)
-    OR_FEE_PCT               default 0.15   (OpenRouter platform fee fraction)
-    SHARE_SLOPE              default 0.758  (from lever_sensitivity.py throughput slope)
+Env knobs:
+    L40S_PER_HR              default 1.00
+    H100_PER_HR              default 2.00
+    H100_THROUGHPUT_X        default 3.0
+    OR_FEE_PCT               default 0.15
+    SHARE_SLOPE              default 0.40   (conservative throughput→share slope)
+    LOOKBACK_DAYS            default 7      (revenue averaging window)
 
 Outputs:
-    analysis/out/margin_analysis.md       markdown report for the meeting
-    analysis/out/margin_analysis.csv      per-model table
+    analysis/out/margin_analysis.md
+    analysis/out/margin_analysis.csv
 """
 from __future__ import annotations
 
-import glob
 import os
-import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-import requests
 
+from analysis.api_client import APIError, APIUnavailable, require_alive
+from analysis.competitive_position import (
+    extract_levers,
+    provider_slug_from_endpoint,
+)
 
-# ---------------------------------------------------------------------------
-# Config — change these to match DekaLLM's actual contracts
-# ---------------------------------------------------------------------------
-L40S_PER_HR = float(os.environ.get("L40S_PER_HR", "1.40"))     # ≈ baseline cloud L40S rental
-H100_PER_HR = float(os.environ.get("H100_PER_HR", "3.00"))     # ≈ H100 80GB rental
-H100_THROUGHPUT_X = float(os.environ.get("H100_THROUGHPUT_X", "3.0"))   # 2.5-3.5x typical for LLM inference
-OR_FEE_PCT = float(os.environ.get("OR_FEE_PCT", "0.15"))       # OpenRouter takes 15%
-# Throughput slope from lever_sensitivity.py (share change per unit gap closed).
-# Conservative: regression said +0.758 but the projection is widely held to be
-# overstated due to linear extrapolation. Use a discounted slope as default.
-SHARE_SLOPE = float(os.environ.get("SHARE_SLOPE", "0.40"))     # ~half of regression slope, conservative
+L40S_PER_HR = float(os.environ.get("L40S_PER_HR", "1.00"))
+H100_PER_HR = float(os.environ.get("H100_PER_HR", "2.00"))
+H100_THROUGHPUT_X = float(os.environ.get("H100_THROUGHPUT_X", "3.0"))
+OR_FEE_PCT = float(os.environ.get("OR_FEE_PCT", "0.15"))
+SHARE_SLOPE = float(os.environ.get("SHARE_SLOPE", "0.40"))
+LOOKBACK_DAYS = int(os.environ.get("LOOKBACK_DAYS", "7"))
 
 L40S_PER_DAY = L40S_PER_HR * 24
 H100_PER_DAY = H100_PER_HR * 24
 H100_COST_MULTIPLIER = H100_PER_HR / L40S_PER_HR
-# Net cost ratio: if you go faster by X but each GPU costs more by Y, GPUs needed
-# drops by X but each costs Y more. Net daily cost change factor:
 H100_DAILY_COST_FACTOR = H100_COST_MULTIPLIER / H100_THROUGHPUT_X
 
-PROM_URL = os.environ.get("PROM_URL", "http://localhost:9090")
 DEKALLM_SLUG = "dekallm"
-ROOT = Path(__file__).resolve().parent.parent
 OUT = Path(__file__).resolve().parent / "out"
 OUT.mkdir(exist_ok=True)
 
 
 # ---------------------------------------------------------------------------
-# Load DekaLLM revenue history from CSVs
+# Per-model pricing & throughput from the API
 # ---------------------------------------------------------------------------
-def load_csv(path: Path) -> pd.DataFrame:
-    with open(path) as f:
-        lines = f.readlines()
-    header_idx = next(i for i, line in enumerate(lines) if line.startswith("Date,"))
-    df = pd.read_csv(path, skiprows=header_idx)
-    df = df[df["Date"].astype(str).str.match(r"\d{4}-\d{2}-\d{2}")].copy()
+def get_dekallm_endpoint(client, model_id: str) -> dict | None:
+    """Return DekaLLM's endpoint payload for one model, or None.
+
+    Used to extract input/output price + throughput for the revenue math.
+    """
+    resolved = client.resolve(model_id)
+    try:
+        details = client.scrape_model_details(resolved)
+    except APIError:
+        details = {}
+    if not details and resolved != model_id:
+        try:
+            details = client.scrape_model_details(model_id)
+        except APIError:
+            details = {}
+    endpoints = (details if isinstance(details, list)
+                 else details.get("endpoints") or details.get("providers")
+                 or details.get("data") or [])
+    for ep in endpoints:
+        if isinstance(ep, dict) and provider_slug_from_endpoint(ep) == DEKALLM_SLUG:
+            return ep
+    return None
+
+
+def get_leader_throughput(client, model_id: str) -> float | None:
+    resolved = client.resolve(model_id)
+    try:
+        details = client.scrape_model_details(resolved)
+    except APIError:
+        return None
+    endpoints = (details if isinstance(details, list)
+                 else details.get("endpoints") or details.get("providers")
+                 or details.get("data") or [])
+    throughputs = []
+    for ep in endpoints:
+        levers = extract_levers(ep)
+        tp = levers.get("throughput")
+        if isinstance(tp, (int, float)):
+            throughputs.append(float(tp))
+    return max(throughputs) if throughputs else None
+
+
+# ---------------------------------------------------------------------------
+# Revenue from token volume × pricing
+# ---------------------------------------------------------------------------
+def load_dekallm_token_history(client, lookback_days: int = LOOKBACK_DAYS) -> pd.DataFrame:
+    """Per-(date, model) token volume from the analytics API, last N finalized days."""
+    rows = client.db_provider_tokens(DEKALLM_SLUG)
+    flat = []
+    for row in rows:
+        date = row.get("date")
+        if not date:
+            continue
+        for model, tokens in row.get("tokens", {}).items():
+            flat.append({"Date": date, "Model": model, "tokens": int(tokens)})
+    if not flat:
+        return pd.DataFrame()
+    df = pd.DataFrame(flat)
     df["Date"] = pd.to_datetime(df["Date"])
-    for c in ["Requests", "Input Tokens", "Output Tokens", "Cached Tokens",
-              "Total Tokens", "Input Cost", "Output Cost", "Total Cost"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-
-def load_dekallm_history(lookback_days: int = 7) -> pd.DataFrame:
-    """Return DekaLLM daily revenue table for the last `lookback_days` complete days."""
-    paths = sorted(glob.glob(str(ROOT / "dekallm_daily_report_2026_*.csv")))
-    if not paths:
-        raise FileNotFoundError("No dekallm_daily_report_*.csv found in repo root")
-    frames = [load_csv(Path(p)) for p in paths]
-    df = pd.concat(frames, ignore_index=True).drop_duplicates(subset=["Date", "Model"])
     df = df.sort_values(["Model", "Date"]).reset_index(drop=True)
-
-    # Drop today's partial day
-    today = pd.Timestamp(datetime.now(timezone.utc).date())
-    df = df[df["Date"] < today]
-
-    # Keep last lookback_days complete days
     last_date = df["Date"].max()
     cutoff = last_date - pd.Timedelta(days=lookback_days - 1)
-    df = df[df["Date"] >= cutoff]
-    return df
+    return df[df["Date"] >= cutoff].copy()
+
+
+def daily_revenue(tokens: float, input_price_per_million: float | None,
+                  output_price_per_million: float | None) -> float | None:
+    """Estimate gross revenue assuming a 50/50 input/output split.
+
+    Returns None if pricing isn't available. Real I/O ratios vary per model
+    (chat is output-heavy, summarization input-heavy); 50/50 is a crude
+    blended rate that's close enough for portfolio-level numbers and avoids
+    needing per-day input/output breakdown.
+    """
+    if input_price_per_million is None and output_price_per_million is None:
+        return None
+    in_price = input_price_per_million if input_price_per_million is not None else (output_price_per_million or 0)
+    out_price = output_price_per_million if output_price_per_million is not None else (input_price_per_million or 0)
+    # Average price per million tokens
+    avg_per_million = (in_price + out_price) / 2
+    return tokens * avg_per_million / 1_000_000
 
 
 # ---------------------------------------------------------------------------
-# Throughput per model from Prometheus
+# Per-model economics
 # ---------------------------------------------------------------------------
-def prom_query(query: str) -> list[dict]:
-    r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": query}, timeout=30)
-    r.raise_for_status()
-    payload = r.json()
-    if payload.get("status") != "success":
-        raise RuntimeError(f"prom error: {payload}")
-    return payload["data"]["result"]
-
-
-_DATE_SUFFIX = re.compile(r"-\d{8}$")
-
-
-def get_dekallm_throughput(model_permaslug: str) -> float | None:
-    """Get DekaLLM's p50 throughput (t/s) for a model, trying base slug if permaslug fails."""
-    for candidate in (model_permaslug, _DATE_SUFFIX.sub("", model_permaslug)):
-        q = (f'max(openrouter_endpoint_throughput_tokens_per_second'
-             f'{{model_id="{candidate}",provider_name="DekaLLM",quantile="p50"}})')
-        res = prom_query(q)
-        if res:
-            return float(res[0]["value"][1])
-    return None
-
-
-def get_leader_throughput(model_permaslug: str) -> float | None:
-    """Get the highest p50 throughput across any provider for this model."""
-    for candidate in (model_permaslug, _DATE_SUFFIX.sub("", model_permaslug)):
-        q = (f'max(openrouter_endpoint_throughput_tokens_per_second'
-             f'{{model_id="{candidate}",quantile="p50"}})')
-        res = prom_query(q)
-        if res:
-            return float(res[0]["value"][1])
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Per-model unit economics
-# ---------------------------------------------------------------------------
-def estimate_gpus_in_service(daily_tokens: float, t_per_sec: float) -> float:
-    """How many GPUs (on average) it takes to serve this volume at this throughput.
-    Assumes 24/7 utilization, single-replica per GPU. Real life has utilization
-    fluctuations — the number is a lower-bound estimate of fleet size."""
-    if t_per_sec <= 0:
+def estimate_gpus(daily_tokens: float, tps: float | None) -> float:
+    if not tps or tps <= 0:
         return float("nan")
-    tokens_per_day_per_gpu = t_per_sec * 86400
-    return daily_tokens / tokens_per_day_per_gpu
+    return daily_tokens / (tps * 86400)
 
 
-def per_model_economics(model_id: str, history: pd.DataFrame) -> dict | None:
+def per_model_economics(client, model_id: str, history: pd.DataFrame) -> dict | None:
     sub = history[history["Model"] == model_id]
     if sub.empty:
         return None
-    avg_daily_tokens = float(sub["Total Tokens"].mean())
-    avg_daily_input_tokens = float(sub["Input Tokens"].mean())
-    avg_daily_output_tokens = float(sub["Output Tokens"].mean())
-    avg_daily_gross_revenue = float(sub["Total Cost"].mean())  # this is what OR charges customers
-    avg_daily_requests = float(sub["Requests"].mean())
 
-    # DekaLLM's net revenue after OpenRouter fee
-    avg_daily_net_revenue = avg_daily_gross_revenue * (1 - OR_FEE_PCT)
+    avg_daily_tokens = float(sub["tokens"].mean())
 
-    # DekaLLM observed throughput
-    dek_tps = get_dekallm_throughput(model_id)
-    leader_tps = get_leader_throughput(model_id)
+    ep = get_dekallm_endpoint(client, model_id)
+    levers = extract_levers(ep) if ep else {}
+    in_price = levers.get("input_price")
+    out_price = levers.get("output_price")
+    dek_tps = levers.get("throughput")
+    leader_tps = get_leader_throughput(client, model_id)
+
+    gross = daily_revenue(avg_daily_tokens, in_price, out_price)
+    net = gross * (1 - OR_FEE_PCT) if gross is not None else None
+
+    gpus_l40s = estimate_gpus(avg_daily_tokens, dek_tps)
+    cost_l40s = gpus_l40s * L40S_PER_DAY if gpus_l40s == gpus_l40s else float("nan")
+    margin_l40s = (net - cost_l40s) if (net is not None and cost_l40s == cost_l40s) else float("nan")
+
+    gpus_h100 = gpus_l40s / H100_THROUGHPUT_X if gpus_l40s == gpus_l40s else float("nan")
+    cost_h100 = gpus_h100 * H100_PER_DAY if gpus_h100 == gpus_h100 else float("nan")
+    margin_h100_static = (net - cost_h100) if (net is not None and cost_h100 == cost_h100) else float("nan")
+
+    # Share-lift projection on H100
+    share_lift_pp = 0.0
+    projected_revenue = net if net is not None else 0.0
     throughput_gap = None
     if dek_tps is not None and leader_tps is not None and leader_tps > 0:
-        throughput_gap = (dek_tps - leader_tps) / leader_tps  # negative if behind
-
-    # Current L40S economics
-    gpus_l40s = (estimate_gpus_in_service(avg_daily_tokens, dek_tps)
-                 if dek_tps else float("nan"))
-    cost_l40s_per_day = gpus_l40s * L40S_PER_DAY if gpus_l40s == gpus_l40s else float("nan")
-    margin_l40s = avg_daily_net_revenue - cost_l40s_per_day if cost_l40s_per_day == cost_l40s_per_day else float("nan")
-
-    # H100 swap: throughput rises by H100_THROUGHPUT_X. GPUs needed at same volume falls.
-    # If demand stays the same, the cost change is the H100_DAILY_COST_FACTOR.
-    gpus_h100 = gpus_l40s / H100_THROUGHPUT_X if gpus_l40s == gpus_l40s else float("nan")
-    cost_h100_per_day_static = gpus_h100 * H100_PER_DAY if gpus_h100 == gpus_h100 else float("nan")
-    margin_h100_static = avg_daily_net_revenue - cost_h100_per_day_static if cost_h100_per_day_static == cost_h100_per_day_static else float("nan")
-
-    # Project share lift if H100 closes part of the throughput gap.
-    # New throughput = current × H100_THROUGHPUT_X. New gap = (new_tput - leader)/leader.
-    projected_revenue_h100 = avg_daily_net_revenue  # baseline
-    share_lift_pp = 0.0
-    if (dek_tps is not None and leader_tps is not None and throughput_gap is not None):
-        new_dek_tps = dek_tps * H100_THROUGHPUT_X
-        new_gap = (new_dek_tps - leader_tps) / leader_tps
-        gap_closed = throughput_gap - new_gap  # how much of the (negative) gap was reduced
-        # share lift per regression: slope * (-gap_closed)
-        share_lift = -gap_closed * SHARE_SLOPE  # positive expected if dek was behind
+        throughput_gap = (dek_tps - leader_tps) / leader_tps
+        new_tps = dek_tps * H100_THROUGHPUT_X
+        new_gap = (new_tps - leader_tps) / leader_tps
+        gap_closed = throughput_gap - new_gap
+        share_lift = -gap_closed * SHARE_SLOPE
         share_lift_pp = share_lift * 100
-        # if share lifts by X pp, revenue scales by (current_share + share_lift) / current_share
-        # but we don't have share directly here — approximate with revenue scaling.
-        # The simpler model: revenue scales proportionally to share. So:
-        # if share_lift is +5pp and current share is 10pp, revenue scales by 1.5x.
-        # We don't have current share here, so we just estimate the additional revenue from
-        # share_lift relative to the model's TOTAL market revenue (= demand × price).
-        # Approximation: assume current dekallm revenue corresponds to current share fraction;
-        # share lift of share_lift_pp gives additional revenue ≈
-        #   avg_daily_gross_revenue * (share_lift / current_share)
-        # but again share isn't here. Punt: just flag the share lift in pp.
-        # Conservative: project up to a 2x revenue multiplier capped.
-        if share_lift > 0:
-            multiplier = min(1.0 + share_lift * 3.0, 2.0)  # rough scaling; capped at 2x
-            projected_revenue_h100 = avg_daily_net_revenue * multiplier
+        if share_lift > 0 and net is not None:
+            multiplier = min(1.0 + share_lift * 3.0, 2.0)
+            projected_revenue = net * multiplier
 
-    margin_h100_projected = projected_revenue_h100 - cost_h100_per_day_static if cost_h100_per_day_static == cost_h100_per_day_static else float("nan")
+    margin_h100_projected = (projected_revenue - cost_h100) if cost_h100 == cost_h100 else float("nan")
 
     return {
         "model_id": model_id,
         "avg_daily_tokens": avg_daily_tokens,
-        "avg_daily_input_tokens": avg_daily_input_tokens,
-        "avg_daily_output_tokens": avg_daily_output_tokens,
-        "avg_daily_requests": avg_daily_requests,
-        "avg_daily_gross_revenue": avg_daily_gross_revenue,
-        "avg_daily_net_revenue": avg_daily_net_revenue,
+        "avg_daily_gross_revenue": gross,
+        "avg_daily_net_revenue": net,
+        "input_price_per_million": in_price,
+        "output_price_per_million": out_price,
         "dek_throughput_tps": dek_tps,
         "leader_throughput_tps": leader_tps,
         "throughput_gap": throughput_gap,
         "gpus_l40s_estimate": gpus_l40s,
-        "cost_l40s_per_day": cost_l40s_per_day,
+        "cost_l40s_per_day": cost_l40s,
         "margin_l40s": margin_l40s,
         "gpus_h100_estimate": gpus_h100,
-        "cost_h100_per_day_static": cost_h100_per_day_static,
+        "cost_h100_per_day_static": cost_h100,
         "margin_h100_static": margin_h100_static,
         "share_lift_pp_h100": share_lift_pp,
-        "projected_revenue_h100": projected_revenue_h100,
+        "projected_revenue_h100": projected_revenue,
         "margin_h100_projected": margin_h100_projected,
     }
+
+
+# ---------------------------------------------------------------------------
+# Planner cross-check
+# ---------------------------------------------------------------------------
+def call_planner_compute(client, chip: str, dollar_per_gpu_hr: float) -> dict | None:
+    """Best-effort call to /planner/compute. Body schema is not yet known
+    (couldn't probe live), so we try a few field name variations and return
+    whichever succeeds. If all fail, returns None.
+    """
+    payload_variants = [
+        {"chip": chip, "dollar_per_gpu_hr": dollar_per_gpu_hr},
+        {"hardware": chip, "dollar_per_gpu_hr": dollar_per_gpu_hr},
+        {"chip": chip, "price_override": dollar_per_gpu_hr},
+        {"chip": chip},  # use planner default pricing
+    ]
+    for body in payload_variants:
+        try:
+            return client.planner_compute(body)
+        except APIError:
+            continue
+        except APIUnavailable:
+            return None
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Report
 # ---------------------------------------------------------------------------
 def fmt_money(v) -> str:
-    if v is None or (isinstance(v, float) and v != v):  # None or NaN
+    if v is None or (isinstance(v, float) and v != v):
         return "—"
     return f"${v:,.2f}"
 
@@ -255,144 +261,177 @@ def fmt_pct(v) -> str:
     return f"{v*100:+.1f}%"
 
 
-def write_report(results: list[dict]) -> str:
-    out = []
-    out.append("# DekaLLM Margin Analysis — L40S vs H100\n")
+def write_report(results: list[dict], planner_l40s: dict | None,
+                 planner_h100: dict | None) -> str:
+    out = ["# DekaLLM Margin Analysis — L40S vs H100\n"]
     out.append(f"Generated: {datetime.now(timezone.utc).isoformat()}\n")
+    out.append("\n## Assumptions\n")
+    out.append(f"- L40S cost: **${L40S_PER_HR:.2f} / GPU / hr** "
+               f"(${L40S_PER_DAY:.2f} / GPU / day) — DekaLLM contracted rate")
+    out.append(f"- H100 cost: **${H100_PER_HR:.2f} / GPU / hr** "
+               f"(${H100_PER_DAY:.2f} / GPU / day) — DekaLLM contracted rate")
+    out.append(f"- H100 throughput multiplier: **{H100_THROUGHPUT_X}×** "
+               f"(typical for LLM inference; verify per model)")
+    out.append(f"- OpenRouter fee: **{OR_FEE_PCT*100:.0f}%** of gross")
+    out.append(f"- Throughput→share slope: **{SHARE_SLOPE}** "
+               f"(from lever_sensitivity.py, conservatively discounted)")
+    out.append(f"- Revenue window: **{LOOKBACK_DAYS}** most recent finalized days\n")
 
-    out.append("\n## Assumptions used\n")
-    out.append(f"- L40S cost: **${L40S_PER_HR:.2f} / GPU / hr** (${L40S_PER_DAY:.2f} / GPU / day)")
-    out.append(f"- H100 cost: **${H100_PER_HR:.2f} / GPU / hr** (${H100_PER_DAY:.2f} / GPU / day)")
-    out.append(f"- H100 throughput multiplier: **{H100_THROUGHPUT_X}×** (typical for LLM inference)")
-    out.append(f"- OpenRouter fee: **{OR_FEE_PCT*100:.0f}%** of gross revenue")
-    out.append(f"- Throughput share-slope: **{SHARE_SLOPE}** "
-               f"(from lever_sensitivity.py, conservatively discounted)\n")
-
-    out.append("Override any of these with env vars before re-running. "
-               "Defaults are 2026-era industry rentals; replace with DekaLLM's "
-               "actual contracted prices for the real number.\n")
-
-    # Aggregate totals
     totals = {
-        "gross_rev": sum(r["avg_daily_gross_revenue"] for r in results),
-        "net_rev":   sum(r["avg_daily_net_revenue"] for r in results),
-        "cost_l40s": sum(r["cost_l40s_per_day"] for r in results if r["cost_l40s_per_day"] == r["cost_l40s_per_day"]),
-        "cost_h100": sum(r["cost_h100_per_day_static"] for r in results if r["cost_h100_per_day_static"] == r["cost_h100_per_day_static"]),
-        "margin_l40s": sum(r["margin_l40s"] for r in results if r["margin_l40s"] == r["margin_l40s"]),
-        "margin_h100_static": sum(r["margin_h100_static"] for r in results if r["margin_h100_static"] == r["margin_h100_static"]),
-        "margin_h100_proj": sum(r["margin_h100_projected"] for r in results if r["margin_h100_projected"] == r["margin_h100_projected"]),
+        "gross_rev": sum((r["avg_daily_gross_revenue"] or 0) for r in results),
+        "net_rev":   sum((r["avg_daily_net_revenue"] or 0) for r in results),
+        "cost_l40s": sum(r["cost_l40s_per_day"] for r in results
+                         if r["cost_l40s_per_day"] == r["cost_l40s_per_day"]),
+        "cost_h100": sum(r["cost_h100_per_day_static"] for r in results
+                         if r["cost_h100_per_day_static"] == r["cost_h100_per_day_static"]),
+        "margin_l40s": sum(r["margin_l40s"] for r in results
+                           if r["margin_l40s"] == r["margin_l40s"]),
+        "margin_h100_static": sum(r["margin_h100_static"] for r in results
+                                  if r["margin_h100_static"] == r["margin_h100_static"]),
+        "margin_h100_proj": sum(r["margin_h100_projected"] for r in results
+                                if r["margin_h100_projected"] == r["margin_h100_projected"]),
+        "proj_rev": sum(r["projected_revenue_h100"] for r in results),
     }
 
-    out.append("\n## Headline — daily numbers, summed across all DekaLLM models\n")
-    out.append(f"| | L40S (current) | H100 (constant demand) | H100 (with share lift) |")
-    out.append(f"|---|---:|---:|---:|")
-    out.append(f"| Gross revenue / day | {fmt_money(totals['gross_rev'])} | {fmt_money(totals['gross_rev'])} | (model-projected, see below) |")
-    out.append(f"| Net revenue / day (after OR fee) | {fmt_money(totals['net_rev'])} | {fmt_money(totals['net_rev'])} | {fmt_money(sum(r['projected_revenue_h100'] for r in results))} |")
-    out.append(f"| GPU cost / day | {fmt_money(totals['cost_l40s'])} | {fmt_money(totals['cost_h100'])} | {fmt_money(totals['cost_h100'])} |")
-    out.append(f"| **Daily margin** | **{fmt_money(totals['margin_l40s'])}** | **{fmt_money(totals['margin_h100_static'])}** | **{fmt_money(totals['margin_h100_proj'])}** |")
-    out.append(f"| **Monthly margin (×30)** | **{fmt_money(totals['margin_l40s']*30)}** | **{fmt_money(totals['margin_h100_static']*30)}** | **{fmt_money(totals['margin_h100_proj']*30)}** |\n")
+    out.append("\n## Headline (sum across all DekaLLM models, $ per day)\n")
+    out.append("| | L40S (current) | H100 (constant demand) | H100 (with share lift) |")
+    out.append("|---|---:|---:|---:|")
+    out.append(f"| Gross revenue / day | {fmt_money(totals['gross_rev'])} | "
+               f"{fmt_money(totals['gross_rev'])} | (projected) |")
+    out.append(f"| Net revenue / day | {fmt_money(totals['net_rev'])} | "
+               f"{fmt_money(totals['net_rev'])} | {fmt_money(totals['proj_rev'])} |")
+    out.append(f"| GPU cost / day | {fmt_money(totals['cost_l40s'])} | "
+               f"{fmt_money(totals['cost_h100'])} | {fmt_money(totals['cost_h100'])} |")
+    out.append(f"| **Daily margin** | **{fmt_money(totals['margin_l40s'])}** | "
+               f"**{fmt_money(totals['margin_h100_static'])}** | "
+               f"**{fmt_money(totals['margin_h100_proj'])}** |")
+    out.append(f"| **Monthly (×30)** | **{fmt_money(totals['margin_l40s']*30)}** | "
+               f"**{fmt_money(totals['margin_h100_static']*30)}** | "
+               f"**{fmt_money(totals['margin_h100_proj']*30)}** |\n")
 
-    # Net cost-only effect of swap (constant demand)
     if totals["cost_l40s"] > 0:
-        cost_change_pct = (totals["cost_h100"] - totals["cost_l40s"]) / totals["cost_l40s"] * 100
-        out.append(f"**Cost-only effect of swap** (same demand, faster GPUs): "
-                   f"daily GPU cost changes by {cost_change_pct:+.1f}% "
-                   f"(${totals['cost_h100'] - totals['cost_l40s']:+.2f}/day).\n")
-        if cost_change_pct < 0:
-            out.append("H100 is *cheaper* to operate at the same throughput because "
-                       "the throughput multiplier outweighs the per-GPU price premium. "
-                       "Even before any share-growth benefit.\n")
-        else:
-            out.append("H100 is *more expensive* to operate at the same throughput. "
-                       "Only justifiable if the share lift from faster routing pays back "
-                       "the cost premium.\n")
+        cost_delta_pct = (totals["cost_h100"] - totals["cost_l40s"]) / totals["cost_l40s"] * 100
+        out.append(f"**Cost-only effect of L40S→H100 swap** (same demand): "
+                   f"daily GPU cost changes by {cost_delta_pct:+.1f}% "
+                   f"(${totals['cost_h100'] - totals['cost_l40s']:+,.2f}/day).\n")
+        if cost_delta_pct < 0:
+            out.append("H100 is *cheaper* at constant throughput because "
+                       f"the {H100_THROUGHPUT_X}× speedup outweighs the "
+                       f"{H100_COST_MULTIPLIER:.1f}× price premium.\n")
+
+    if planner_l40s or planner_h100:
+        out.append("\n## Planner cross-check (`/planner/compute`)\n")
+        out.append("Independent estimate from the analytics service's optimizer, "
+                   "using our pricing overrides:\n")
+        if planner_l40s:
+            out.append(f"\n**L40S @ ${L40S_PER_HR}/hr**\n")
+            out.append(f"```\n{planner_l40s}\n```\n")
+        if planner_h100:
+            out.append(f"\n**H100 @ ${H100_PER_HR}/hr**\n")
+            out.append(f"```\n{planner_h100}\n```\n")
 
     out.append("\n## Per-model breakdown\n")
-    out.append("| Model | Net rev/day | DekaLLM t/s | Leader t/s | GPUs (L40S) | Cost L40S | Margin L40S | GPUs (H100) | Cost H100 | Margin H100 (static) | Margin H100 (with share lift) |")
+    out.append("| Model | Net rev/day | DekaLLM t/s | Leader t/s | GPUs L40S | "
+               "Cost L40S | Margin L40S | GPUs H100 | Cost H100 | Margin H100 (static) | "
+               "Margin H100 (share lift) |")
     out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     for r in results:
         out.append(
-            f"| {r['model_id']} | "
-            f"{fmt_money(r['avg_daily_net_revenue'])} | "
-            f"{fmt_int(r['dek_throughput_tps'])} | "
-            f"{fmt_int(r['leader_throughput_tps'])} | "
-            f"{fmt_int(r['gpus_l40s_estimate'])} | "
-            f"{fmt_money(r['cost_l40s_per_day'])} | "
-            f"{fmt_money(r['margin_l40s'])} | "
-            f"{fmt_int(r['gpus_h100_estimate'])} | "
-            f"{fmt_money(r['cost_h100_per_day_static'])} | "
-            f"{fmt_money(r['margin_h100_static'])} | "
+            f"| {r['model_id']} | {fmt_money(r['avg_daily_net_revenue'])} | "
+            f"{fmt_int(r['dek_throughput_tps'])} | {fmt_int(r['leader_throughput_tps'])} | "
+            f"{fmt_int(r['gpus_l40s_estimate'])} | {fmt_money(r['cost_l40s_per_day'])} | "
+            f"{fmt_money(r['margin_l40s'])} | {fmt_int(r['gpus_h100_estimate'])} | "
+            f"{fmt_money(r['cost_h100_per_day_static'])} | {fmt_money(r['margin_h100_static'])} | "
             f"{fmt_money(r['margin_h100_projected'])} |"
         )
 
     out.append("\n## Caveats\n")
-    out.append("- **GPU count is an estimate.** Computed as `daily_tokens / (t/s × 86400)`. "
-               "Assumes 24/7 utilization; real fleet size is higher because of utilization spikes.\n")
-    out.append("- **Throughput multiplier is generic.** H100-vs-L40S speedup varies by model size, "
-               "quantization, and inference engine. 2.5-3.5× is typical for LLM inference; for very large "
-               "models (>70B), the speedup can be 4-5× because H100's larger VRAM removes tensor-parallel "
-               "overhead.\n")
-    out.append("- **Share lift is regression-derived.** Treats throughput→share as linear, which it isn't at "
-               "the tails. Real lift is between the 'static' and 'projected' columns.\n")
-    out.append("- **Doesn't include amortized capex / data-center costs / engineering time** to migrate. "
-               "Add those before committing.\n")
-    out.append("- **Numbers come from OpenRouter dashboard data only.** Any private/enterprise customers "
-               "not routed through OpenRouter are not in this analysis.\n")
+    out.append(
+        "- **GPU count is a *minimum* estimate.** Computed as "
+        "`daily_tokens / (t/s × 86400)`. Assumes 24/7 utilization at the "
+        "observed throughput. Real fleet size is higher due to utilization "
+        "spikes and continuous-batching headroom. DekaLLM's actual fleet is "
+        "92 L40S + 4 H100 cards.\n"
+        "- **Revenue uses 50/50 input/output token split.** Real ratio varies "
+        "by model. Per-model accuracy could improve with daily I/O breakdown "
+        "from `/db/models/{slug}/activity` once that endpoint is verified.\n"
+        "- **Throughput multiplier is generic.** H100/L40S speedup is 2.5-4× "
+        "depending on model size and tensor-parallel config. For models that "
+        "need TP>1 on L40S (no NVLink penalty), the H100 win is bigger.\n"
+        "- **Share lift is regression-derived.** Throughput→share treated as "
+        "linear, which it isn't at the tails. Real lift is between the "
+        "'static' and 'with share lift' columns.\n"
+        "- **`/db/benchmarks` is currently empty.** Real measured throughput "
+        "would replace the multiplier estimate — flag for the team.\n"
+    )
     return "\n".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def main() -> None:
-    print(f"Loading DekaLLM CSV history (last 7 complete days)...")
-    history = load_dekallm_history(lookback_days=7)
+    client = require_alive()
+    print(f"Using analytics API at {client.base}\n")
+    print(f"Loading DekaLLM token history (last {LOOKBACK_DAYS} days)...")
+    history = load_dekallm_token_history(client, LOOKBACK_DAYS)
     if history.empty:
-        print("No CSV history found — make sure dekallm_daily_report_*.csv files exist.")
+        print("No token history. Aborting.")
         return
 
     models = sorted(history["Model"].unique())
-    print(f"Models with revenue data: {len(models)}")
+    print(f"  Models with token data: {len(models)}")
     for m in models:
-        print(f"  {m}")
+        print(f"    {m}")
 
-    print(f"\nComputing margins under L40S (${L40S_PER_HR:.2f}/hr) vs H100 (${H100_PER_HR:.2f}/hr, {H100_THROUGHPUT_X}x faster)...")
+    print(f"\nComputing margins (L40S=${L40S_PER_HR}/hr, "
+          f"H100=${H100_PER_HR}/hr, throughput {H100_THROUGHPUT_X}×)...")
     results = []
     for m in models:
-        r = per_model_economics(m, history)
+        r = per_model_economics(client, m, history)
         if r:
             results.append(r)
             tps = r["dek_throughput_tps"]
-            print(f"  {m}: net_rev=${r['avg_daily_net_revenue']:.2f}/day, "
-                  f"tps={tps if tps else 'unknown'}, "
-                  f"L40S margin=${r['margin_l40s']:.2f}, "
-                  f"H100 margin (static)=${r['margin_h100_static']:.2f}")
+            net = r["avg_daily_net_revenue"]
+            print(f"  {m}: net_rev={fmt_money(net)}/day, "
+                  f"tps={fmt_int(tps)}, "
+                  f"margin L40S={fmt_money(r['margin_l40s'])}")
 
-    # Markdown report
-    md = write_report(results)
+    # Planner cross-check
+    print("\nCross-checking with /planner/compute...")
+    planner_l40s = call_planner_compute(client, "L40S", L40S_PER_HR)
+    planner_h100 = call_planner_compute(client, "H100", H100_PER_HR)
+    if planner_l40s:
+        print(f"  L40S planner result: {type(planner_l40s).__name__} "
+              f"({'data' if isinstance(planner_l40s, dict) and 'data' in planner_l40s else 'raw'})")
+    else:
+        print("  Planner unreachable or schema mismatch — skipped.")
+
+    md = write_report(results, planner_l40s, planner_h100)
     md_path = OUT / "margin_analysis.md"
     with open(md_path, "w") as f:
         f.write(md)
     print(f"\nMarkdown report -> {md_path}")
 
-    # CSV
     csv_path = OUT / "margin_analysis.csv"
     pd.DataFrame(results).to_csv(csv_path, index=False)
-    print(f"CSV              -> {csv_path}")
+    print(f"CSV             -> {csv_path}")
 
-    # Console summary
-    totals_l40s = sum(r["margin_l40s"] for r in results if r["margin_l40s"] == r["margin_l40s"])
-    totals_h100_static = sum(r["margin_h100_static"] for r in results if r["margin_h100_static"] == r["margin_h100_static"])
-    totals_h100_proj = sum(r["margin_h100_projected"] for r in results if r["margin_h100_projected"] == r["margin_h100_projected"])
-
+    totals_l40s = sum(r["margin_l40s"] for r in results
+                      if r["margin_l40s"] == r["margin_l40s"])
+    totals_h100_static = sum(r["margin_h100_static"] for r in results
+                             if r["margin_h100_static"] == r["margin_h100_static"])
+    totals_h100_proj = sum(r["margin_h100_projected"] for r in results
+                           if r["margin_h100_projected"] == r["margin_h100_projected"])
     print("\n" + "=" * 78)
-    print("Aggregate daily margin (across all DekaLLM models)")
+    print("Aggregate daily margin")
     print("=" * 78)
-    print(f"  L40S (current):                  ${totals_l40s:>10,.2f}/day  (${totals_l40s*30:,.2f}/month)")
-    print(f"  H100 (same demand, faster GPUs): ${totals_h100_static:>10,.2f}/day  (${totals_h100_static*30:,.2f}/month)")
-    print(f"  H100 (with share-lift projection): ${totals_h100_proj:>10,.2f}/day  (${totals_h100_proj*30:,.2f}/month)")
-    if totals_l40s != 0:
-        delta_static_pct = (totals_h100_static - totals_l40s) / abs(totals_l40s) * 100
-        delta_proj_pct = (totals_h100_proj - totals_l40s) / abs(totals_l40s) * 100
-        print(f"\n  H100 vs L40S (static):           {delta_static_pct:+.1f}% margin change")
-        print(f"  H100 vs L40S (with share lift):  {delta_proj_pct:+.1f}% margin change")
+    print(f"  L40S (current):                    {fmt_money(totals_l40s):>14} / day  "
+          f"({fmt_money(totals_l40s*30)} / month)")
+    print(f"  H100 (same demand):                {fmt_money(totals_h100_static):>14} / day  "
+          f"({fmt_money(totals_h100_static*30)} / month)")
+    print(f"  H100 (with share-lift projection): {fmt_money(totals_h100_proj):>14} / day  "
+          f"({fmt_money(totals_h100_proj*30)} / month)")
 
 
 if __name__ == "__main__":

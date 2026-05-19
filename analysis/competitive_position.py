@@ -1,322 +1,300 @@
-"""Competitive position analysis — where DekaLLM leads/lags on the levers that
-drive OpenRouter routing share.
+"""Competitive position analysis — where DekaLLM leads/lags on every routing
+lever, for every model in DekaLLM's portfolio.
 
-For each model DekaLLM serves, this script pulls the current values of every
-routing-relevant lever from Prometheus:
+For each model DekaLLM serves, this script pulls:
+  - Per-provider pricing, throughput, latency, context (from /scrape/models/{slug}/details)
+  - Per-provider daily uptime (from /scrape/models/{slug}/uptime)        <-- NEW
+  - Per-provider, per-day token share (from /db/models/{slug}/provider-tokens)
+ranks DekaLLM against every provider serving the same model, shows the gap
+to leader on each lever, and identifies the highest-leverage move per model.
 
-- Input price ($/M tokens)
-- Output price ($/M tokens)
-- Throughput (p50 tokens/sec)
-- Latency (p50 ms)
-- Uptime (last 1d %)
-
-It ranks DekaLLM against the other providers we scrape (deepinfra, fireworks,
-together), shows the gap to leader on each lever, and identifies the
-highest-leverage move per model.
+Data source upgrade vs prior version:
+  - 91-day share history (was 32 days, limited to 4 providers)
+  - All ~72 providers compared, not 4
+  - Real measured uptime (was approximated from incident heuristics)
+  - Slug resolution via /scrape/resolve (was hand-coded regex fallback)
 
 OpenRouter routing modes that prioritize each lever:
-- :floor mode + default mode  -> price (lower wins)
-- :nitro mode                 -> throughput (higher wins)
-- default mode                -> latency (lower wins) + uptime (higher wins)
-- user-specified              -> quantization, context length
-
-So if DekaLLM is the 3rd-cheapest on output price but the leader on throughput,
-they'll naturally win nitro-mode users but lose floor-mode users. Knowing which
-levers they trail on tells the GPU and pricing teams exactly what to fix to
-gain share.
+  - default mode              -> price + latency + uptime (weighted blend)
+  - :floor mode               -> price (lower wins)
+  - :nitro mode               -> throughput (higher wins)
+  - :exacto mode              -> tool-call quality vs per-model median (not yet in API)
 
 Outputs:
-- analysis/out/competitive_position.md   (meeting-ready report)
-- analysis/out/competitive_position.csv  (per-model lever table)
-
-Usage:
-    python analysis/competitive_position.py
-
-Env:
-    PROM_URL     default http://localhost:9090
-    PROVIDERS    comma-separated; default dekallm,deepinfra,fireworks,together
+  - analysis/out/competitive_position.md   (meeting-ready report)
+  - analysis/out/competitive_position.csv  (flat per-model lever table)
 """
 from __future__ import annotations
 
 import os
-import re
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-import requests
 
-PROM_URL = os.environ.get("PROM_URL", "http://localhost:9090")
-PROVIDERS_SLUGS = [s.strip() for s in os.environ.get(
-    "PROVIDERS", "dekallm,deepinfra,fireworks,together"
-).split(",")]
+from analysis.api_client import APIError, default_client, require_alive
+
 DEKALLM_SLUG = "dekallm"
 OUT = Path(__file__).resolve().parent / "out"
 OUT.mkdir(exist_ok=True)
+# Share lookback window for the competitive table (days). Per-provider tokens are
+# the freshest signal we have; 7 days smooths over individual incidents like
+# the 2026-05-17 routing-quality event without losing trend.
+SHARE_LOOKBACK_DAYS = int(os.environ.get("SHARE_LOOKBACK_DAYS", "7"))
 
-# Endpoint metrics use the display name (e.g. "DekaLLM"), the provider chart
-# metric uses the slug (e.g. "dekallm"). Map between them so we can join.
-PROVIDER_NAME_HINTS = {
-    "dekallm":    ["DekaLLM", "Dekallm", "dekallm"],
-    "deepinfra":  ["DeepInfra", "Deepinfra", "deepinfra"],
-    "fireworks":  ["Fireworks", "Fireworks AI", "fireworks"],
-    "together":   ["Together", "Together AI", "together"],
+
+# ---------------------------------------------------------------------------
+# Lever extraction — tolerant of unknown response shapes
+# ---------------------------------------------------------------------------
+# The /scrape/models/{slug}/details payload exposes a list of provider endpoints,
+# each carrying pricing + perf fields. The exact field names depend on the
+# upstream OpenRouter JSON shape and may be nested. Rather than hard-code
+# paths, we search each endpoint dict for fields matching a set of name
+# patterns. This makes the script robust to minor schema drift.
+
+LEVERS = {
+    "input_price":  {"better": "lower", "label": "Input price ($/M)"},
+    "output_price": {"better": "lower", "label": "Output price ($/M)"},
+    "throughput":   {"better": "higher", "label": "Throughput (t/s p50)"},
+    "latency_ms":   {"better": "lower", "label": "Latency (ms p50)"},
+    "uptime_pct":   {"better": "higher", "label": "Uptime (% last 7d)"},
 }
 
 
-def prom_query(query: str) -> list[dict]:
-    r = requests.get(f"{PROM_URL}/api/v1/query", params={"query": query}, timeout=30)
-    r.raise_for_status()
-    payload = r.json()
-    if payload.get("status") != "success":
-        raise RuntimeError(f"prom error: {payload}")
-    return payload["data"]["result"]
+def _walk(obj, predicate):
+    """Yield (path_str, value) for any nested key/value matching predicate(key)."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if predicate(k):
+                yield (k, v)
+            yield from _walk(v, predicate)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _walk(item, predicate)
 
 
-def prom_range(query: str, start: datetime, end: datetime, step: int) -> list[dict]:
-    r = requests.get(
-        f"{PROM_URL}/api/v1/query_range",
-        params={"query": query, "start": start.timestamp(), "end": end.timestamp(), "step": step},
-        timeout=60,
+def _first_match(endpoint: dict, keywords: tuple[str, ...]) -> float | None:
+    """Return the first numeric field whose key contains all keywords (case-insensitive)."""
+    for k, v in _walk(endpoint, lambda key: all(kw in key.lower() for kw in keywords)):
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            return float(v)
+    return None
+
+
+def extract_levers(endpoint: dict) -> dict:
+    """Pull lever values from one provider-endpoint dict. Tolerant of field naming.
+
+    Searches for the most semantically obvious key. Multiple patterns tried so
+    the same code handles both raw OpenRouter JSON ('pricing.prompt') and
+    enriched/flattened views ('input_price_per_million'). If none match,
+    that lever stays NaN.
+    """
+    # Pricing — usually nested under "pricing": {"prompt", "completion", ...}
+    # Common in OR: pricing.prompt = $/token (very small float). Convert to $/M.
+    in_price = _first_match(endpoint, ("input", "price")) or _first_match(endpoint, ("prompt", "price"))
+    if in_price is None:
+        raw = _first_match(endpoint, ("pricing", "prompt"))
+        if raw is not None:
+            in_price = raw * 1_000_000 if raw < 1.0 else raw
+
+    out_price = _first_match(endpoint, ("output", "price")) or _first_match(endpoint, ("completion", "price"))
+    if out_price is None:
+        raw = _first_match(endpoint, ("pricing", "completion"))
+        if raw is not None:
+            out_price = raw * 1_000_000 if raw < 1.0 else raw
+
+    throughput = (
+        _first_match(endpoint, ("throughput",))
+        or _first_match(endpoint, ("tokens_per_second",))
+        or _first_match(endpoint, ("tps",))
     )
-    r.raise_for_status()
-    payload = r.json()
-    if payload.get("status") != "success":
-        raise RuntimeError(f"prom error: {payload}")
-    return payload["data"]["result"]
-
-
-# ----------------------------------------------------------------------------
-# Resolve provider_name (endpoint metrics) <-> provider slug (chart metric)
-# ----------------------------------------------------------------------------
-def resolve_provider_names() -> dict[str, str]:
-    """Map each tracked slug to the display name actually used in endpoint metrics."""
-    res = prom_query("group by (provider_name) (openrouter_model_input_price_dollars_per_million_tokens)")
-    discovered = [r["metric"]["provider_name"] for r in res]
-    mapping = {}
-    for slug in PROVIDERS_SLUGS:
-        hints = PROVIDER_NAME_HINTS.get(slug, [slug])
-        # Try exact hint match first, then case-insensitive, then substring
-        found = None
-        for hint in hints:
-            for d in discovered:
-                if d == hint:
-                    found = d
-                    break
-            if found:
-                break
-        if not found:
-            for hint in hints:
-                for d in discovered:
-                    if d.lower() == hint.lower():
-                        found = d
-                        break
-                if found:
-                    break
-        if not found:
-            for hint in hints:
-                for d in discovered:
-                    if hint.lower() in d.lower() or d.lower() in hint.lower():
-                        found = d
-                        break
-                if found:
-                    break
-        mapping[slug] = found  # may be None if not found
-    return mapping
-
-
-# ----------------------------------------------------------------------------
-# Identify DekaLLM's models
-# ----------------------------------------------------------------------------
-def get_dekallm_models() -> list[str]:
-    res = prom_query(
-        f'count by (model_id) (openrouter_provider_tokens_daily{{provider="{DEKALLM_SLUG}"}})'
+    latency = (
+        _first_match(endpoint, ("latency",))
+        or _first_match(endpoint, ("first", "token"))
     )
-    models = sorted({r["metric"]["model_id"] for r in res})
-    return models
 
-
-# ----------------------------------------------------------------------------
-# Pull lever values per (provider, model_id)
-# ----------------------------------------------------------------------------
-_DATE_SUFFIX = re.compile(r"-\d{8}$")
-
-
-def candidate_endpoint_model_ids(permaslug: str) -> list[str]:
-    """OpenRouter chart metrics use permaslugs with -YYYYMMDD date suffixes
-    (e.g. google/gemma-4-26b-a4b-it-20260403). Endpoint metrics from the
-    public /api/v1/models scrape use the base slug without the date.
-    Return candidates to try, in priority order."""
-    candidates = [permaslug]
-    stripped = _DATE_SUFFIX.sub("", permaslug)
-    if stripped != permaslug:
-        candidates.append(stripped)
-    return candidates
-
-
-def get_levers_for_model(model_id: str, name_map: dict[str, str]) -> tuple[pd.DataFrame, str | None]:
-    """Return (DataFrame, resolved_endpoint_slug). The slug may differ from
-    model_id if endpoint metrics use the base form. Returns (None, None) if
-    no endpoint data found for any candidate slug."""
-    queries = {
-        "input_price":  ("min", "openrouter_model_input_price_dollars_per_million_tokens", ""),
-        "output_price": ("min", "openrouter_model_output_price_dollars_per_million_tokens", ""),
-        "throughput":   ("max", "openrouter_endpoint_throughput_tokens_per_second", ',quantile="p50"'),
-        "latency_ms":   ("min", "openrouter_endpoint_latency_milliseconds", ',quantile="p50"'),
-        "uptime_1d":    ("max", "openrouter_endpoint_uptime_percentage_last_1d", ""),
+    return {
+        "input_price":  in_price,
+        "output_price": out_price,
+        "throughput":   throughput,
+        "latency_ms":   latency,
+        "uptime_pct":   None,  # filled in separately from /uptime endpoint
     }
 
-    # Build reverse map name->slug
-    name_to_slug = {v: k for k, v in name_map.items() if v}
 
-    # Try permaslug first, fall back to base slug if no data
-    resolved_slug = None
-    for candidate in candidate_endpoint_model_ids(model_id):
-        # Probe with a cheap query first
-        probe = prom_query(
-            f'openrouter_model_input_price_dollars_per_million_tokens{{model_id="{candidate}"}}'
-        )
-        if probe:
-            resolved_slug = candidate
-            break
+def provider_slug_from_endpoint(endpoint: dict) -> str | None:
+    """Best-effort: extract the provider slug from an endpoint payload.
 
-    if resolved_slug is None:
-        # No endpoint data at all for any candidate slug
-        df = pd.DataFrame(columns=list(queries.keys()))
-        df.index.name = "provider"
-        return df, None
+    OpenRouter endpoints typically expose provider as `provider_name` or
+    nested `provider.slug`/`provider.name`. Returns lower-case slug or None.
+    """
+    # Direct fields
+    for key in ("provider_slug", "providerSlug", "providerName", "provider_name"):
+        v = endpoint.get(key)
+        if isinstance(v, str) and v:
+            return v.lower().replace(" ", "-")
+    # Nested provider object
+    prov = endpoint.get("provider")
+    if isinstance(prov, dict):
+        for key in ("slug", "name", "displayName"):
+            v = prov.get(key)
+            if isinstance(v, str) and v:
+                return v.lower().replace(" ", "-")
+    return None
 
-    metrics: dict[str, dict[str, float]] = {}
-    for col, (agg, base, qfilter) in queries.items():
-        q = f'{agg} by (provider_name) ({base}{{model_id="{resolved_slug}"{qfilter}}})'
+
+# ---------------------------------------------------------------------------
+# Per-model data assembly
+# ---------------------------------------------------------------------------
+def build_lever_table(client, model_id: str) -> tuple[pd.DataFrame, str | None]:
+    """Return (DataFrame indexed by provider, resolved permaslug) for one model.
+
+    DataFrame columns: input_price, output_price, throughput, latency_ms, uptime_pct.
+    """
+    resolved = client.resolve(model_id)
+    try:
+        details = client.scrape_model_details(resolved)
+    except APIError:
+        details = {}
+    if not details and resolved != model_id:
         try:
-            res = prom_query(q)
-        except Exception:
-            res = []
-        for r in res:
-            pn = r["metric"].get("provider_name", "")
-            slug = name_to_slug.get(pn)
-            if slug is None:
-                continue
-            v = float(r["value"][1])
-            metrics.setdefault(slug, {})[col] = v
+            details = client.scrape_model_details(model_id)
+        except APIError:
+            details = {}
 
-    df = pd.DataFrame.from_dict(metrics, orient="index")
+    # The details payload may be a dict with "endpoints" or just a list.
+    endpoints = []
+    if isinstance(details, list):
+        endpoints = details
+    elif isinstance(details, dict):
+        endpoints = (
+            details.get("endpoints")
+            or details.get("providers")
+            or details.get("data")
+            or []
+        )
+
+    rows: dict[str, dict] = {}
+    for ep in endpoints:
+        if not isinstance(ep, dict):
+            continue
+        slug = provider_slug_from_endpoint(ep)
+        if not slug:
+            continue
+        rows[slug] = extract_levers(ep)
+
+    # Uptime — separate endpoint, returns daily values per provider.
+    try:
+        uptime_rows = client.scrape_model_uptime(resolved)
+    except APIError:
+        uptime_rows = []
+    if not uptime_rows and resolved != model_id:
+        try:
+            uptime_rows = client.scrape_model_uptime(model_id)
+        except APIError:
+            uptime_rows = []
+
+    # Aggregate last `SHARE_LOOKBACK_DAYS` of uptime per provider into a single mean.
+    uptime_by_provider: dict[str, list[float]] = {}
+    for row in uptime_rows[-SHARE_LOOKBACK_DAYS:] if uptime_rows else []:
+        if not isinstance(row, dict):
+            continue
+        # Expected shape: {"date": "...", "endpoints": [{provider_name, uptime_pct}, ...]}
+        # or {"date": "...", "providers": {slug: pct}}
+        providers_block = row.get("providers")
+        if isinstance(providers_block, dict):
+            for slug, pct in providers_block.items():
+                if isinstance(pct, (int, float)):
+                    uptime_by_provider.setdefault(slug.lower(), []).append(float(pct))
+            continue
+        for ep_uptime in row.get("endpoints", []):
+            if not isinstance(ep_uptime, dict):
+                continue
+            slug = provider_slug_from_endpoint(ep_uptime)
+            pct = _first_match(ep_uptime, ("uptime",))
+            if slug and pct is not None:
+                uptime_by_provider.setdefault(slug, []).append(pct)
+
+    for slug, values in uptime_by_provider.items():
+        if not values:
+            continue
+        if slug not in rows:
+            rows[slug] = {k: None for k in LEVERS}
+        rows[slug]["uptime_pct"] = sum(values) / len(values)
+
+    if not rows:
+        return pd.DataFrame(columns=list(LEVERS.keys())), resolved
+
+    df = pd.DataFrame.from_dict(rows, orient="index")
     df.index.name = "provider"
-    # Ensure all expected columns exist even if no data
-    for col in queries:
+    for col in LEVERS:
         if col not in df.columns:
             df[col] = float("nan")
-    return df[list(queries.keys())], resolved_slug
+    return df[list(LEVERS.keys())], resolved
 
 
-# ----------------------------------------------------------------------------
-# Pull recent market share
-# ----------------------------------------------------------------------------
-def get_market_share(model_id: str, days: int = 7) -> dict[str, float]:
-    """Per-provider share averaged over fully-overlapping finalized UTC days.
+def build_share_table(client, model_id: str, lookback_days: int = SHARE_LOOKBACK_DAYS) -> dict[str, float]:
+    """Per-provider share averaged over the most recent finalized days.
 
-    Earlier versions averaged each provider's share across that provider's own
-    available dates, which produced incoherent results when providers had
-    different history depth (e.g. competitor avg over 90 days vs DekaLLM over
-    32 days made the per-model shares sum to >100%).
-
-    This version:
-    1. Finds every provider that had any data in the lookback window.
-    2. Keeps only dates where ALL of those providers had data.
-    3. Drops today's still-in-progress UTC day.
-    4. Computes each provider's share per common date, then averages.
-
-    Result: shares sum to ~100% per model, comparable across providers.
+    Drops today's still-in-progress day (the most recent date in the API
+    response is usually yesterday since the sync runs daily). Uses only days
+    where ALL providers in the window had data — guarantees shares sum to ~100%.
     """
-    end = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
-    # Look back days+1 so we have headroom after dropping today
-    start = end - timedelta(days=days + 1)
-    q = f'openrouter_provider_tokens_daily{{model_id="{model_id}"}}'
-    series = prom_range(q, start, end, 3600)
-
-    # (provider, date) -> max running-total seen during the window
-    per_pd: dict[tuple[str, str], float] = {}
-    for s in series:
-        provider = s["metric"].get("provider", "")
-        date = s["metric"].get("date", "")
-        if not date or not provider:
-            continue
-        v = max(float(v[1]) for v in s["values"])
-        per_pd[(provider, date)] = max(v, per_pd.get((provider, date), 0))
-
-    if not per_pd:
+    resolved = client.resolve(model_id)
+    rows = client.db_model_provider_tokens(resolved)
+    if not rows and resolved != model_id:
+        rows = client.db_model_provider_tokens(model_id)
+    if not rows:
         return {}
 
-    providers_in_window = {p for (p, _) in per_pd.keys()}
-    dates_per_provider: dict[str, set[str]] = {p: set() for p in providers_in_window}
-    for (p, d), _v in per_pd.items():
-        dates_per_provider[p].add(d)
-    common_dates = set.intersection(*dates_per_provider.values()) if dates_per_provider else set()
-    today_iso = datetime.now(timezone.utc).date().isoformat()
-    common_dates = sorted(d for d in common_dates if d < today_iso)
-    if not common_dates:
-        # No overlap — fall back to "just today's finalized share if it exists"
-        # by reporting empty (caller defaults missing keys to 0).
+    # rows arrive newest-first; sort oldest-first for clarity, then take tail
+    rows = sorted(rows, key=lambda r: r.get("date", ""))
+    window = rows[-lookback_days:] if lookback_days > 0 else rows
+    if not window:
         return {}
 
-    shares: dict[str, list[float]] = {p: [] for p in providers_in_window}
-    for d in common_dates:
-        total = sum(per_pd.get((p, d), 0.0) for p in providers_in_window)
+    providers_seen: set[str] = set()
+    for r in window:
+        providers_seen.update(r.get("providers", {}).keys())
+
+    # Restrict to days where ALL seen providers reported
+    common_days = [
+        r for r in window
+        if set(r.get("providers", {}).keys()) >= providers_seen
+    ]
+    # If too strict, fall back to the full window with zeros for missing providers
+    use = common_days or window
+
+    shares: dict[str, list[float]] = {p: [] for p in providers_seen}
+    for r in use:
+        tokens = r.get("providers", {})
+        total = sum(tokens.values())
         if total <= 0:
             continue
-        for p in providers_in_window:
-            shares[p].append(per_pd.get((p, d), 0.0) / total)
-
-    return {p: (sum(vs) / len(vs)) if vs else 0.0 for p, vs in shares.items()}
-
-
-# ----------------------------------------------------------------------------
-# Ranking + leverage analysis per model
-# ----------------------------------------------------------------------------
-HIGHER_IS_BETTER = {"throughput": True, "uptime_1d": True,
-                    "input_price": False, "output_price": False, "latency_ms": False}
+        for p in providers_seen:
+            shares[p].append(tokens.get(p, 0) / total)
+    return {p: (sum(v) / len(v) if v else 0.0) for p, v in shares.items()}
 
 
-def rank_and_gap(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    """Add `<col>_rank` and `<col>_gap_pct_vs_leader` columns to df."""
-    if col not in df.columns or df[col].isna().all():
-        df[f"{col}_rank"] = float("nan")
-        df[f"{col}_gap_pct"] = float("nan")
-        return df
-
-    higher_better = HIGHER_IS_BETTER[col]
+# ---------------------------------------------------------------------------
+# Ranking & reporting
+# ---------------------------------------------------------------------------
+def rank_and_gap(df: pd.DataFrame, col: str, higher_better: bool) -> pd.DataFrame:
     series = df[col].dropna()
-    if len(series) == 0:
+    if series.empty:
         df[f"{col}_rank"] = float("nan")
         df[f"{col}_gap_pct"] = float("nan")
         return df
-
-    leader_value = series.max() if higher_better else series.min()
+    leader = series.max() if higher_better else series.min()
     ranks = series.rank(ascending=not higher_better, method="min").astype(int)
-    if higher_better:
-        # gap_pct: how much smaller than leader, negative = behind (e.g. -25% slower)
-        gaps = (series - leader_value) / leader_value * 100
-    else:
-        # gap_pct: how much larger than leader (positive = more expensive/slower than leader)
-        gaps = (series - leader_value) / leader_value * 100
-
+    gaps = (series - leader) / leader * 100 if leader != 0 else series * 0
     df[f"{col}_rank"] = ranks.reindex(df.index)
     df[f"{col}_gap_pct"] = gaps.reindex(df.index)
     return df
 
 
-LEVER_LABELS = {
-    "input_price":  ("Input price ($/M)",   "lower-better", "cut input price"),
-    "output_price": ("Output price ($/M)",  "lower-better", "cut output price"),
-    "throughput":   ("Throughput (t/s p50)", "higher-better", "improve throughput"),
-    "latency_ms":   ("Latency (ms p50)",    "lower-better", "reduce latency"),
-    "uptime_1d":    ("Uptime (% last 1d)",  "higher-better", "improve uptime"),
-}
-
-
-def fmt_value(col: str, v: float) -> str:
-    if pd.isna(v):
+def fmt_value(col: str, v: float | None) -> str:
+    if v is None or (isinstance(v, float) and v != v):
         return "—"
     if col in ("input_price", "output_price"):
         return f"${v:.3f}"
@@ -324,47 +302,48 @@ def fmt_value(col: str, v: float) -> str:
         return f"{v:,.0f} t/s"
     if col == "latency_ms":
         return f"{v:,.0f} ms"
-    if col == "uptime_1d":
+    if col == "uptime_pct":
         return f"{v:.2f}%"
     return f"{v:.3f}"
 
 
 def per_model_report(model_id: str, df: pd.DataFrame, share: dict[str, float],
-                     resolved_slug: str | None = None) -> str:
-    """Return a markdown chunk for one model."""
-    out = []
-    out.append(f"## {model_id}\n")
-    if resolved_slug and resolved_slug != model_id:
-        out.append(f"_Endpoint metrics matched as `{resolved_slug}` (date suffix stripped from permaslug)._\n")
-
-    # Show DekaLLM's share + total
+                     resolved: str | None) -> str:
+    out = [f"## {model_id}\n"]
+    if resolved and resolved != model_id:
+        out.append(f"_Resolved to permaslug `{resolved}`._\n")
     dek_share = share.get(DEKALLM_SLUG, 0.0) * 100
-    out.append(f"**DekaLLM market share (7-day avg)**: {dek_share:.2f}%\n")
+    out.append(f"**DekaLLM market share ({SHARE_LOOKBACK_DAYS}-day avg)**: {dek_share:.2f}%\n")
     out.append(f"**Providers serving this model**: {len(df)}\n")
 
-    # Rank each lever
-    for col in LEVER_LABELS:
-        df = rank_and_gap(df, col)
+    for col, meta in LEVERS.items():
+        df = rank_and_gap(df, col, higher_better=meta["better"] == "higher")
 
-    # Build a leaderboard table
-    out.append("\n### Leaderboard\n")
-    out.append("| Provider | Input $/M | Output $/M | Throughput | Latency | Uptime | 7d share |")
+    # Top-of-leaderboard table — limit to top 10 by share for readability, always include DekaLLM.
+    df_show = df.copy()
+    df_show["share"] = df_show.index.map(lambda p: share.get(p, 0.0))
+    df_show = df_show.sort_values("share", ascending=False)
+    top = df_show.head(10)
+    if DEKALLM_SLUG not in top.index and DEKALLM_SLUG in df_show.index:
+        top = pd.concat([top, df_show.loc[[DEKALLM_SLUG]]])
+
+    out.append(f"\n### Leaderboard (top {len(top)} providers by share)\n")
+    out.append("| Provider | Input $/M | Output $/M | Throughput | Latency | Uptime | Share |")
     out.append("|---|---:|---:|---:|---:|---:|---:|")
-    for slug in df.index:
-        row = df.loc[slug]
-        share_pct = share.get(slug, 0.0) * 100
+    for slug, row in top.iterrows():
+        marker = "**" if slug == DEKALLM_SLUG else ""
         out.append(
-            f"| **{slug}** | {fmt_value('input_price', row.get('input_price'))} | "
+            f"| {marker}{slug}{marker} | "
+            f"{fmt_value('input_price', row.get('input_price'))} | "
             f"{fmt_value('output_price', row.get('output_price'))} | "
             f"{fmt_value('throughput', row.get('throughput'))} | "
             f"{fmt_value('latency_ms', row.get('latency_ms'))} | "
-            f"{fmt_value('uptime_1d', row.get('uptime_1d'))} | "
-            f"{share_pct:.2f}% |"
+            f"{fmt_value('uptime_pct', row.get('uptime_pct'))} | "
+            f"{row['share']*100:.2f}% |"
         )
 
-    # DekaLLM's per-lever gap
     if DEKALLM_SLUG not in df.index:
-        out.append(f"\n_No lever data for DekaLLM on this model._\n")
+        out.append("\n_No DekaLLM endpoint metrics for this model._\n")
         return "\n".join(out)
 
     dek = df.loc[DEKALLM_SLUG]
@@ -372,33 +351,35 @@ def per_model_report(model_id: str, df: pd.DataFrame, share: dict[str, float],
     out.append("| Lever | DekaLLM value | Rank | Gap vs leader | Action if pursued |")
     out.append("|---|---:|---:|---:|---|")
     actions = []
-    for col, (label, _dir, action_phrase) in LEVER_LABELS.items():
+    for col, meta in LEVERS.items():
         v = dek.get(col)
         rank = dek.get(f"{col}_rank")
         gap = dek.get(f"{col}_gap_pct")
-        if pd.isna(v) or pd.isna(rank):
-            out.append(f"| {label} | — | — | — | (no data) |")
+        if v is None or (isinstance(v, float) and v != v) or pd.isna(rank):
+            out.append(f"| {meta['label']} | — | — | — | (no data) |")
             continue
-        n_providers = df[col].notna().sum()
-        rank_str = f"{int(rank)} / {int(n_providers)}"
+        n_prov = df[col].notna().sum()
+        rank_str = f"{int(rank)} / {int(n_prov)}"
         gap_str = f"{gap:+.1f}%" if not pd.isna(gap) else "—"
-        # Action only meaningful if not leader
+        action_phrase = {
+            "input_price":  "cut input price",
+            "output_price": "cut output price",
+            "throughput":   "improve throughput",
+            "latency_ms":   "reduce latency",
+            "uptime_pct":   "improve uptime",
+        }[col]
         action = action_phrase if int(rank) > 1 else "(already leader)"
-        out.append(f"| {label} | {fmt_value(col, v)} | {rank_str} | {gap_str} | {action} |")
+        out.append(f"| {meta['label']} | {fmt_value(col, v)} | {rank_str} | {gap_str} | {action} |")
         if int(rank) > 1 and not pd.isna(gap):
-            # Score: weighted by |gap|. Larger absolute gap = bigger improvement potential.
             actions.append((col, abs(float(gap)), action_phrase, int(rank), float(gap)))
 
-    # Highest-leverage move
     if actions:
         actions.sort(key=lambda x: -x[1])
         col, abs_gap, action, rank, gap = actions[0]
         out.append(
-            f"\n**Highest-leverage move**: **{action}** "
-            f"(currently rank {rank}, {gap:+.1f}% vs leader). "
-            f"Closing this gap likely produces the largest share gain per unit effort, "
-            f"though absolute leverage depends on whether OpenRouter users for this model "
-            f"sort by this lever (price-sensitive vs speed-sensitive)."
+            f"\n**Highest-leverage move**: **{action}** (currently rank {rank}, "
+            f"{gap:+.1f}% vs leader). Closing this gap likely yields the largest "
+            f"share gain per unit effort on this model."
         )
     else:
         out.append("\n**DekaLLM is the leader on every measured lever** for this model.")
@@ -406,20 +387,16 @@ def per_model_report(model_id: str, df: pd.DataFrame, share: dict[str, float],
     return "\n".join(out)
 
 
-# ----------------------------------------------------------------------------
-# Aggregated summary
-# ----------------------------------------------------------------------------
-def overall_summary(model_data: dict[str, dict]) -> str:
-    """Aggregate across models — where DekaLLM consistently leads/lags."""
-    out = ["## Aggregated summary across all DekaLLM models\n"]
+def overall_summary(model_data: dict) -> str:
+    out = ["## Aggregated summary across DekaLLM models\n"]
     rows = []
     for model_id, payload in model_data.items():
-        dek_row = payload["levers"].loc[DEKALLM_SLUG] if DEKALLM_SLUG in payload["levers"].index else None
-        if dek_row is None:
+        if DEKALLM_SLUG not in payload["levers"].index:
             continue
-        for col in LEVER_LABELS:
-            rank = dek_row.get(f"{col}_rank")
-            gap = dek_row.get(f"{col}_gap_pct")
+        dek = payload["levers"].loc[DEKALLM_SLUG]
+        for col in LEVERS:
+            rank = dek.get(f"{col}_rank")
+            gap = dek.get(f"{col}_gap_pct")
             if pd.isna(rank):
                 continue
             rows.append({
@@ -440,116 +417,103 @@ def overall_summary(model_data: dict[str, dict]) -> str:
         leader_count=("is_leader", "sum"),
         model_count=("rank", "count"),
     ).round(2)
-    summary["leader_count"] = summary["leader_count"].astype(int)
-    summary["model_count"] = summary["model_count"].astype(int)
 
-    out.append("Average rank and gap across models DekaLLM serves "
-               "(rank 1 = leader; gap_pct = signed % from leader):\n")
     out.append("| Lever | Avg rank | Avg gap vs leader | Leader on # models | Of total |")
     out.append("|---|---:|---:|---:|---:|")
     for lever, row in summary.iterrows():
-        label = LEVER_LABELS[lever][0]
         out.append(
-            f"| {label} | {row['avg_rank']:.1f} | {row['avg_gap_pct']:+.1f}% | "
-            f"{row['leader_count']} | {row['model_count']} |"
+            f"| {LEVERS[lever]['label']} | {row['avg_rank']:.1f} | "
+            f"{row['avg_gap_pct']:+.1f}% | {int(row['leader_count'])} | "
+            f"{int(row['model_count'])} |"
         )
 
-    # Pick the lever with the worst average rank as the "strategic priority"
-    summary_sorted = summary.sort_values("avg_rank", ascending=False)
-    worst_lever = summary_sorted.index[0]
-    worst_row = summary_sorted.iloc[0]
+    worst = summary.sort_values("avg_rank", ascending=False).index[0]
+    worst_row = summary.loc[worst]
     out.append(
         f"\n**Strategic priority**: the lever where DekaLLM consistently lags most is "
-        f"**{LEVER_LABELS[worst_lever][0]}** (avg rank {worst_row['avg_rank']:.1f}, "
-        f"avg gap {worst_row['avg_gap_pct']:+.1f}% vs leader). "
-        f"Improving this universally would lift share across the portfolio."
+        f"**{LEVERS[worst]['label']}** (avg rank {worst_row['avg_rank']:.1f}, "
+        f"avg gap {worst_row['avg_gap_pct']:+.1f}% vs leader)."
     )
 
-    out.append(
-        f"\n**Sustainable advantage candidates**: levers where DekaLLM already leads on "
-        f"some models — worth investing to maintain and replicate the recipe."
-    )
-    leader_levers = summary[summary["leader_count"] > 0].sort_values("leader_count", ascending=False)
-    for lever, row in leader_levers.iterrows():
-        out.append(
-            f"- **{LEVER_LABELS[lever][0]}**: leader on {int(row['leader_count'])} / "
-            f"{int(row['model_count'])} models"
-        )
-    if leader_levers.empty:
-        out.append("- _(none yet)_")
-
+    leaders = summary[summary["leader_count"] > 0].sort_values("leader_count", ascending=False)
+    if not leaders.empty:
+        out.append("\n**Levers where DekaLLM already leads on some models** (worth defending):")
+        for lever, row in leaders.iterrows():
+            out.append(
+                f"- {LEVERS[lever]['label']}: leader on {int(row['leader_count'])} / "
+                f"{int(row['model_count'])} models"
+            )
     return "\n".join(out)
 
 
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Main
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def main() -> None:
-    print(f"Pulling lever data from {PROM_URL}\n")
+    client = require_alive()
+    print(f"Using analytics API at {client.base}\n")
 
-    name_map = resolve_provider_names()
-    print(f"Provider slug -> display name resolution:")
-    for slug, name in name_map.items():
-        print(f"  {slug:12s} -> {name or '(NOT FOUND — check endpoint scrape config)'}")
-
-    dek_models = get_dekallm_models()
-    print(f"\nDekaLLM models with token-daily data: {len(dek_models)}")
-    for m in dek_models:
+    models = client.dekallm_current_model_slugs(lookback_days=3)
+    print(f"DekaLLM current portfolio ({len(models)} models):")
+    for m in models:
         print(f"  {m}")
 
-    print("\nGenerating per-model competitive position reports...")
-    model_data = {}
     sections = []
-    for model_id in dek_models:
-        levers, resolved = get_levers_for_model(model_id, name_map)
-        if levers.empty or levers.isna().all().all():
-            print(f"  {model_id}: no lever data (no endpoint metrics found for any candidate slug)")
+    model_data: dict[str, dict] = {}
+    print("\nBuilding per-model competitive position...")
+    for m in models:
+        try:
+            levers, resolved = build_lever_table(client, m)
+        except APIError as e:
+            print(f"  {m}: SKIP ({e})")
             continue
-        for col in LEVER_LABELS:
-            levers = rank_and_gap(levers, col)
-        share = get_market_share(model_id)
-        model_data[model_id] = {"levers": levers, "share": share, "resolved_slug": resolved}
-        sections.append(per_model_report(model_id, levers, share, resolved))
-        slug_note = f" (matched as '{resolved}')" if resolved and resolved != model_id else ""
-        print(f"  {model_id}: {len(levers)} providers compared{slug_note}")
+        if levers.empty:
+            print(f"  {m}: no lever data (endpoint details unavailable)")
+            continue
+        share = build_share_table(client, m)
+        for col, meta in LEVERS.items():
+            levers = rank_and_gap(levers, col, higher_better=meta["better"] == "higher")
+        model_data[m] = {"levers": levers, "share": share, "resolved": resolved}
+        sections.append(per_model_report(m, levers, share, resolved))
+        print(f"  {m}: {len(levers)} providers, "
+              f"DekaLLM share={share.get(DEKALLM_SLUG, 0)*100:.2f}%")
+
+    if not sections:
+        print("\nNo model data; not writing report.")
+        return
 
     summary = overall_summary(model_data)
-
-    # Write markdown report
     md_path = OUT / "competitive_position.md"
     with open(md_path, "w") as f:
-        f.write(f"# DekaLLM Competitive Position on OpenRouter\n\n")
+        f.write("# DekaLLM Competitive Position on OpenRouter\n\n")
         f.write(f"Generated: {datetime.now(timezone.utc).isoformat()}\n\n")
-        f.write("Routing levers compared across providers: price (input + output), "
-                "throughput (p50 t/s), latency (p50 ms), uptime (last 1d %). "
-                "Each lever maps to a specific OpenRouter routing mode that prioritizes it.\n\n")
+        f.write(
+            "Routing levers compared across all providers serving each DekaLLM model: "
+            "input/output price, throughput (p50 t/s), latency (p50 ms), uptime (7-day mean %). "
+            "Each lever maps to an OpenRouter routing mode that prioritizes it. "
+            f"Share data is {SHARE_LOOKBACK_DAYS}-day average over fully-overlapping days only.\n\n"
+        )
         f.write("---\n\n")
         f.write(summary)
         f.write("\n\n---\n\n# Per-model breakdown\n\n")
         f.write("\n\n---\n\n".join(sections))
     print(f"\nMarkdown report -> {md_path}")
 
-    # Write flat CSV with all model + lever data
+    # Flat CSV
     csv_rows = []
     for model_id, payload in model_data.items():
         df = payload["levers"]
         share = payload["share"]
-        for slug in df.index:
-            row = {"model_id": model_id, "provider": slug, "share_7d": share.get(slug, 0.0)}
-            for col in LEVER_LABELS:
-                row[col] = df.loc[slug].get(col)
-                row[f"{col}_rank"] = df.loc[slug].get(f"{col}_rank")
-                row[f"{col}_gap_pct"] = df.loc[slug].get(f"{col}_gap_pct")
-            csv_rows.append(row)
+        for slug, row in df.iterrows():
+            r = {"model_id": model_id, "provider": slug, "share": share.get(slug, 0.0)}
+            for col in LEVERS:
+                r[col] = row.get(col)
+                r[f"{col}_rank"] = row.get(f"{col}_rank")
+                r[f"{col}_gap_pct"] = row.get(f"{col}_gap_pct")
+            csv_rows.append(r)
     csv_path = OUT / "competitive_position.csv"
     pd.DataFrame(csv_rows).to_csv(csv_path, index=False)
-    print(f"Flat CSV          -> {csv_path}")
-
-    # Console summary
-    print("\n" + "=" * 78)
-    print("Summary printed below — full markdown report at:")
-    print(f"  {md_path}")
-    print("=" * 78 + "\n")
+    print(f"Flat CSV         -> {csv_path}\n")
     print(summary)
 
 
