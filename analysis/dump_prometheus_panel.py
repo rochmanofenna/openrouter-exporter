@@ -113,6 +113,60 @@ def pull_daily_tokens(start: datetime, end: datetime) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def pull_model_activity(start: datetime, end: datetime) -> pd.DataFrame:
+    """Per-(model, date) request count and token totals from the /activity scrape.
+
+    This is the *aggregate* across all providers for a model on a given date —
+    used as the denominator for tokens-per-request[M], which the decomposition
+    treats as a model-level property to avoid provider-routing endogeneity.
+
+    Only models in OPENROUTER_ACTIVITY_MODELS have data here (currently
+    DekaLLM's portfolio).
+    """
+    queries = {
+        "model_requests":          "openrouter_model_activity_requests",
+        "model_prompt_tokens":     "openrouter_model_activity_prompt_tokens",
+        "model_completion_tokens": "openrouter_model_activity_completion_tokens",
+    }
+    per_metric: dict[str, pd.DataFrame] = {}
+    for col, q in queries.items():
+        series = prom_range(q, start, end, 86400)
+        rows = []
+        for s in series:
+            model_id = s["metric"].get("model_id")
+            date_label = s["metric"].get("date")  # the activity metric carries 'date' as a label
+            if not model_id:
+                continue
+            for ts, val in s["values"]:
+                # Prefer the metric's own date label (UTC date the activity
+                # references). Fall back to sample timestamp if label missing.
+                if date_label:
+                    date = date_label
+                else:
+                    date = datetime.fromtimestamp(float(ts), tz=timezone.utc).date().isoformat()
+                rows.append({"model_id": model_id, "date": date, col: float(val)})
+        df = pd.DataFrame(rows)
+        if df.empty:
+            continue
+        # Multiple samples per (model, date) → take max (running total)
+        df = df.groupby(["model_id", "date"], as_index=False)[col].max()
+        per_metric[col] = df
+
+    out = None
+    for col, df in per_metric.items():
+        if out is None:
+            out = df
+        else:
+            out = out.merge(df, on=["model_id", "date"], how="outer")
+    if out is None or out.empty:
+        return pd.DataFrame()
+    # Derive total + tpr
+    out["model_total_tokens_activity"] = (
+        out["model_prompt_tokens"].fillna(0) + out["model_completion_tokens"].fillna(0)
+    )
+    return out
+
+
 def pull_endpoint_features(start: datetime, end: datetime,
                            name_to_slug: dict[str, str]) -> pd.DataFrame:
     """Per-(model, provider, date) snapshot of price / throughput / latency / uptime."""
@@ -199,6 +253,15 @@ def add_derived(df: pd.DataFrame) -> pd.DataFrame:
         return "fallback"
     df["uptime_tier"] = df["uptime_1d_pct"].apply(tier)
 
+    # Model-level tokens-per-request, derived from /activity totals.
+    # NaN for models we don't scrape activity on (most non-DekaLLM models).
+    if "model_total_tokens_activity" in df.columns and "model_requests" in df.columns:
+        req = df["model_requests"].astype(float)
+        toks = df["model_total_tokens_activity"].astype(float)
+        df["model_tpr"] = toks / req.where(req > 0)
+    else:
+        df["model_tpr"] = float("nan")
+
     return df
 
 
@@ -222,9 +285,13 @@ def main() -> None:
     features = pull_endpoint_features(start, end, name_to_slug)
     print(f"    {len(features):,} feature rows")
 
-    print("\n4/4 Joining and deriving columns...")
+    print("\n4/5 Pulling model-level activity (requests, prompt/completion tokens)...")
+    activity = pull_model_activity(start, end)
+    print(f"    {len(activity):,} model-activity rows")
+
+    print("\n5/5 Joining and deriving columns...")
     # Join via base_slug (strip date suffix) so permaslug-tagged token rows
-    # match base-slug-tagged feature rows.
+    # match base-slug-tagged feature/activity rows.
     tokens["base_slug"] = tokens["model_id"].apply(base_slug)
     features_renamed = features.rename(columns={"model_id": "base_slug"})
     panel = tokens.merge(
@@ -232,6 +299,13 @@ def main() -> None:
         on=["base_slug", "provider", "date"],
         how="left",
     )
+    if not activity.empty:
+        activity_renamed = activity.rename(columns={"model_id": "base_slug"})
+        panel = panel.merge(activity_renamed, on=["base_slug", "date"], how="left")
+    else:
+        for col in ("model_requests", "model_prompt_tokens",
+                    "model_completion_tokens", "model_total_tokens_activity"):
+            panel[col] = pd.NA
     panel = add_derived(panel)
 
     print(f"\nFinal panel: {len(panel):,} rows")
