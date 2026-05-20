@@ -82,18 +82,54 @@ def prom_range(query: str, start: datetime, end: datetime, step: int) -> list[di
 
 
 def resolve_provider_names() -> dict[str, str]:
-    """Map slug -> display name as used in endpoint metrics."""
-    res = prom("group by (provider_name) (openrouter_model_input_price_dollars_per_million_tokens)")
-    discovered = [r["metric"]["provider_name"] for r in res]
+    """Map every token-side slug -> display name used in endpoint metrics.
+
+    Auto-discovers all (slug, display_name) pairs by querying both metrics
+    and matching by lowercase. Falls back to PROVIDER_NAME_HINTS for tricky
+    cases (compound names like "Google AI Studio").
+    """
+    feat_res = prom("group by (provider_name) (openrouter_model_input_price_dollars_per_million_tokens)")
+    display_names = [r["metric"]["provider_name"] for r in feat_res]
+
+    tok_res = prom("group by (provider) (openrouter_provider_tokens_daily)")
+    slugs = [r["metric"]["provider"] for r in tok_res]
+
     mapping: dict[str, str] = {}
-    for slug, hints in PROVIDER_NAME_HINTS.items():
+    for slug in slugs:
+        # 1) Try hardcoded hints first (handles "google-ai-studio" -> "Google AI Studio")
+        hints = PROVIDER_NAME_HINTS.get(slug, [slug])
         for hint in hints:
-            for d in discovered:
-                if d.lower() == hint.lower() or hint.lower() in d.lower():
+            for d in display_names:
+                if d.lower() == hint.lower():
                     mapping[slug] = d
                     break
             if slug in mapping:
                 break
+
+        # 2) Try exact case-insensitive match on the slug itself
+        if slug not in mapping:
+            for d in display_names:
+                if d.lower() == slug.lower():
+                    mapping[slug] = d
+                    break
+
+        # 3) Try collapsed comparison: strip non-alphanumerics, lowercase
+        if slug not in mapping:
+            slug_norm = "".join(c for c in slug.lower() if c.isalnum())
+            for d in display_names:
+                d_norm = "".join(c for c in d.lower() if c.isalnum())
+                if d_norm == slug_norm:
+                    mapping[slug] = d
+                    break
+
+        # 4) Substring fallback
+        if slug not in mapping:
+            for d in display_names:
+                if slug.lower() in d.lower().replace(" ", "") or \
+                   d.lower().replace(" ", "") in slug.lower():
+                    mapping[slug] = d
+                    break
+
     return mapping
 
 
@@ -332,6 +368,25 @@ def main() -> None:
 
     panel.to_csv(OUT_PATH, index=False)
     print(f"\nSaved: {OUT_PATH}")
+
+    # Also write a forward-filled variant for the fit scripts. Features change
+    # slowly so carrying a recent reading forward across the (M, P) timeline
+    # is a safe approximation that lets the fit use 90 days of token data.
+    filled = panel.copy()
+    filled = filled.sort_values(["base_slug", "provider", "date"])
+    feat_cols = ["input_price", "output_price", "throughput_p50",
+                 "latency_p50_ms", "uptime_1d_pct"]
+    filled[feat_cols] = filled.groupby(["base_slug", "provider"])[feat_cols].ffill()
+    if "model_tpr" in filled.columns:
+        filled["model_tpr"] = filled.groupby("base_slug")["model_tpr"].ffill()
+    filled_path = OUT_PATH.with_name("share_panel_filled.csv")
+    filled.to_csv(filled_path, index=False)
+    print(f"Saved: {filled_path}")
+    complete_filled = filled.dropna(subset=feat_cols + ["token_share"])
+    print(f"  Forward-filled complete-for-fitting rows: {len(complete_filled):,} "
+          f"({complete_filled['model_id'].nunique()} models, "
+          f"{complete_filled['provider'].nunique()} providers, "
+          f"{complete_filled['date'].nunique()} dates)")
 
 
 if __name__ == "__main__":
