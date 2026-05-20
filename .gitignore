@@ -1,4 +1,20 @@
 openrouter-exporter
 bin/
 .env
+.env.*
+*.env
+.envrc
 .claude/
+
+# Credentials — never commit
+*session*cookie*
+*api*key*
+secrets/
+
+# Python artifacts
+__pycache__/
+*.pyc
+
+# Local scrape outputs (regenerable + may contain account data)
+analysis/raw/
+analysis/out/
