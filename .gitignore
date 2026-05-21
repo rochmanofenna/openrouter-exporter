@@ -18,3 +18,4 @@ __pycache__/
 # Local scrape outputs (regenerable + may contain account data)
 analysis/raw/
 analysis/out/
+analysis/data/
